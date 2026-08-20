@@ -28,6 +28,25 @@ function getCustomIcon(appId) {
     return customIconOverrides[key] || "";
 }
 
+function allCustomIcons() {
+    var out = {};
+    for (var k in customIconOverrides) {
+        out[k] = customIconOverrides[k];
+    }
+    return out;
+}
+
+function loadCustomIcons(map) {
+    customIconOverrides = {};
+    if (map && typeof map === "object") {
+        for (var k in map) {
+            var value = String(map[k] || "").trim();
+            if (value) customIconOverrides[String(k).toLowerCase().trim()] = value;
+        }
+    }
+    iconCache = {};
+}
+
 var FALLBACK_MAP = {
     "kitty": "kitty",
     "alacritty": "Alacritty",
@@ -74,13 +93,9 @@ function resolveIcon(appClass, appName, appId) {
     if (iconCache[key]) return iconCache[key];
 
     // Handle Chrome/Chromium/Edge web apps (e.g. chrome-hnpfjngllpiocgelkpfmhdggcdapoihn-Default or crx_...)
+    // Shared JS libraries cannot reach the Quickshell singleton, so fall back to
+    // the closest matching browser icon; the QML layer resolves the final source.
     if (key.indexOf("chrome-") === 0 || key.indexOf("chromium-") === 0 || key.indexOf("crx_") === 0 || key.indexOf("webapp-") === 0) {
-        // If it's a chrome webapp, check if appLibrary or Quickshell can find an icon for it, or fallback to chrome/google-chrome if no specific icon found
-        var qIcon = Quickshell.iconPath(raw, true);
-        if (qIcon && qIcon.length > 0) {
-            iconCache[key] = raw;
-            return raw;
-        }
         iconCache[key] = "google-chrome";
         return "google-chrome";
     }

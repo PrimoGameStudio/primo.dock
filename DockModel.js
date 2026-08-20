@@ -14,13 +14,18 @@ var DEFAULT_PINNED = [
 var DEFAULT_BLACKLIST = [];
 
 var DEFAULT_SETTINGS = {
-    iconSize: 28,
-    itemSize: 46,
-    padding: 6,
-    hoverScale: 1.12,
-    dragScale: 1.22,
-    backgroundOpacity: 0.94,
-    showRunningDots: true
+    iconSize: 38,
+    itemSize: 80,
+    padding: 48,
+    hoverScale: 2,
+    dragScale: 2,
+    backgroundOpacity: 0.98,
+    showRunningDots: true,
+    showTooltips: true,
+    showTooltipsDelay: 350,
+    toggleWithBar: true,
+    showVisualizer: true,
+    visualizerBars: 32
 };
 
 var SETTINGS_CLAMPS = {
@@ -29,7 +34,9 @@ var SETTINGS_CLAMPS = {
     padding: { min: 0, max: 48 },
     hoverScale: { min: 1.0, max: 2.0 },
     dragScale: { min: 1.0, max: 2.5 },
-    backgroundOpacity: { min: 0.0, max: 1.0 }
+    backgroundOpacity: { min: 0.0, max: 1.0 },
+    showTooltipsDelay: { min: 0, max: 5000 },
+    visualizerBars: { min: 4, max: 64 }
 };
 
 function clampNumber(value, min, max, fallback) {
@@ -294,9 +301,109 @@ function entryFor(appRows, appId) {
     return null;
 }
 
-function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appRows, appLibrary) {
+// Attach per-window metadata (workspace, monitor, focus priority) to a toplevel.
+// Workspace/monitor come from the Quickshell HyprlandToplevel attached property.
+function toplevelMeta(toplevel, focusedWorkspaceId, focusedMonitorName) {
+    var meta = {
+        toplevel: toplevel,
+        title: (toplevel && toplevel.title) ? toplevel.title : "",
+        address: "",
+        workspaceId: -1,
+        workspaceName: "",
+        monitorName: "",
+        active: !!(toplevel && toplevel.activated),
+        onFocusedWorkspace: false,
+        onFocusedMonitor: false,
+        minimized: !!(toplevel && toplevel.minimized)
+    };
+    try {
+        var ht = toplevel ? toplevel.HyprlandToplevel : null;
+        if (ht) {
+            if (ht.address) meta.address = "0x" + String(ht.address);
+            var ws = ht.workspace;
+            if (ws) {
+                if (ws.id !== undefined) meta.workspaceId = ws.id;
+                if (ws.name) meta.workspaceName = String(ws.name);
+            }
+            var mon = ht.monitor;
+            if (mon && mon.name) meta.monitorName = String(mon.name);
+        }
+    } catch (e) {}
+    if (focusedWorkspaceId !== undefined && meta.workspaceId === focusedWorkspaceId) {
+        meta.onFocusedWorkspace = true;
+    }
+    if (focusedMonitorName && meta.monitorName === focusedMonitorName) {
+        meta.onFocusedMonitor = true;
+    }
+    return meta;
+}
+
+// Stable sort: windows on the focused workspace first, then the focused monitor, then the rest.
+function sortWindows(metas) {
+    var arr = Array.isArray(metas) ? metas.slice() : [];
+    function priority(m) {
+        if (m && m.onFocusedWorkspace) return 0;
+        if (m && m.onFocusedMonitor) return 1;
+        return 2;
+    }
+    arr.sort(function(a, b) {
+        return priority(a) - priority(b);
+    });
+    return arr;
+}
+
+// macOS-style rotation: next window after the currently active one (full cycle).
+function nextWindowAfterActive(windows, activeToplevel) {
+    var arr = Array.isArray(windows) ? windows : [];
+    if (arr.length === 0) return null;
+    if (arr.length === 1) return arr[0];
+    var activeIdx = -1;
+    for (var i = 0; i < arr.length; i++) {
+        var m = arr[i];
+        if (m.active || (activeToplevel && m.toplevel && m.toplevel === activeToplevel)) {
+            activeIdx = i;
+            break;
+        }
+    }
+    if (activeIdx < 0) return arr[0];
+    return arr[(activeIdx + 1) % arr.length];
+}
+
+// Step through windows by direction (+1/-1) for scroll-wheel cycling.
+function cycleWindow(windows, activeToplevel, direction) {
+    var arr = Array.isArray(windows) ? windows : [];
+    if (arr.length === 0) return null;
+    var activeIdx = -1;
+    for (var i = 0; i < arr.length; i++) {
+        var m = arr[i];
+        if (m.active || (activeToplevel && m.toplevel && m.toplevel === activeToplevel)) {
+            activeIdx = i;
+            break;
+        }
+    }
+    var step = direction > 0 ? 1 : -1;
+    if (activeIdx < 0) {
+        return step > 0 ? arr[0] : arr[arr.length - 1];
+    }
+    var next = activeIdx + step;
+    if (next < 0) next = arr.length - 1;
+    if (next >= arr.length) next = 0;
+    return arr[next];
+}
+
+function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appRows, appLibrary, minimizedIds, focusedWorkspaceId, focusedMonitorName) {
     var pinned = Array.isArray(pinnedIds) ? pinnedIds : [];
     var list = toArray(toplevels);
+
+    var minimizedSet = {};
+    var minArr = Array.isArray(minimizedIds) ? minimizedIds : [];
+    for (var mi = 0; mi < minArr.length; mi++) {
+        var mid = stripDesktop(minArr[mi]);
+        if (mid) minimizedSet[mid] = true;
+    }
+    function isMinimized(appId) {
+        return minimizedSet[stripDesktop(appId)] === true;
+    }
 
     var runningMap = {};
     var runningOrder = [];
@@ -312,15 +419,27 @@ function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appR
 
         if (!runningMap[appId]) {
             runningMap[appId] = {
-                toplevels: [],
+                raw: [],
                 isActive: false
             };
             runningOrder.push(appId);
         }
-        runningMap[appId].toplevels.push(toplevel);
-        if (activeApp === appId || toplevel === activeToplevel || toplevel.active === true) {
+        runningMap[appId].raw.push(toplevel);
+        if (activeApp === appId || toplevel === activeToplevel || toplevel.activated === true) {
             runningMap[appId].isActive = true;
         }
+    }
+
+    // Build per-window metadata (sorted by focus priority) for each running app.
+    for (var rk in runningMap) {
+        var rinfo = runningMap[rk];
+        var metas = [];
+        for (var w = 0; w < rinfo.raw.length; w++) {
+            metas.push(toplevelMeta(rinfo.raw[w], focusedWorkspaceId, focusedMonitorName));
+        }
+        rinfo.toplevels = rinfo.raw;
+        rinfo.windows = sortWindows(metas);
+        rinfo.hasMultipleWindows = rinfo.raw.length > 1;
     }
 
     function enrichItem(base) {
@@ -357,8 +476,11 @@ function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appR
             isPinned: true,
             isRunning: isRun,
             isActive: isRun ? runInfo.isActive : false,
+            isMinimized: isRun && isMinimized(pid),
             windowCount: isRun ? runInfo.toplevels.length : 0,
-            toplevels: isRun ? runInfo.toplevels : []
+            toplevels: isRun ? runInfo.toplevels : [],
+            windows: isRun ? runInfo.windows : [],
+            hasMultipleWindows: isRun ? runInfo.hasMultipleWindows : false
         };
         items.push(enrichItem(item));
     }
@@ -381,10 +503,37 @@ function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appR
             isPinned: false,
             isRunning: true,
             isActive: rInfo.isActive,
+            isMinimized: isMinimized(rid),
             windowCount: rInfo.toplevels.length,
-            toplevels: rInfo.toplevels
+            toplevels: rInfo.toplevels,
+            windows: rInfo.windows,
+            hasMultipleWindows: rInfo.hasMultipleWindows
         };
         items.push(enrichItem(unpinnedItem));
+    }
+
+    // 3. Minimized Apps that are no longer visible in the toplevel list
+    // (e.g. parked on a special workspace) so they can be restored from the dock
+    for (var pid2 in minimizedSet) {
+        if (seen[pid2] || isBlacklisted(blacklistIds, pid2)) continue;
+        seen[pid2] = true;
+        var minimizedItem = {
+            id: "min_" + pid2,
+            appId: pid2,
+            appClass: pid2,
+            exec: pid2,
+            name: pid2,
+            icon: pid2,
+            isPinned: false,
+            isRunning: true,
+            isActive: false,
+            isMinimized: true,
+            windowCount: 0,
+            toplevels: [],
+            windows: [],
+            hasMultipleWindows: false
+        };
+        items.push(enrichItem(minimizedItem));
     }
 
     return items;

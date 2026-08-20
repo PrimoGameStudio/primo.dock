@@ -1,9 +1,9 @@
-{
+﻿{
   "schemaVersion": 1,
   "id": "primo.dock",
   "name": "PrimoDock",
   "version": "1.0.0",
-  "author": "primo",
+  "author": "PrimoGameStudio",
   "license": "MIT",
   "description": "Native animated application dock for Omarchy Quattro with dynamic positioning, Hyprland window tracking, Drag & Drop, and seamless Omarchy theme integration.",
   "kinds": [

@@ -164,6 +164,9 @@ Item {
     property int activeMenuItemIndex: 0
     readonly property bool isMenuOpen: activeMenuItem !== null
 
+    // Blank Space Context Menu State
+    property bool isDockMenuOpen: false
+
     // Exact geometric coordinate centering for the overlay menu
     readonly property real calculatedMenuLeft: {
         var screenW = dockWindow.screen ? dockWindow.screen.width : 1920
@@ -172,7 +175,7 @@ Item {
         var iconCenterX = root.isVertical
             ? dockLeft + root.dockWindowThickness / 2
             : dockLeft + (root.dockWindowLength - root.dockContentLength) / 2 + root.activeMenuItemIndex * root.dockItemSize + (root.dockItemSize - 4) / 2
-        var menuW = 180
+        var menuW = 230
         var targetLeft = iconCenterX - menuW / 2
         return Math.round(Math.max(6, Math.min(screenW - menuW - 6, targetLeft)))
     }
@@ -184,8 +187,7 @@ Item {
         var iconCenterY = root.isVertical
             ? dockTop + (root.dockWindowLength - root.dockContentLength) / 2 + root.activeMenuItemIndex * root.dockItemSize + (root.dockItemSize - 4) / 2
             : dockTop + root.dockWindowThickness / 2
-        var activeItemsCount = 3 + (root.activeMenuItem && root.activeMenuItem.isRunning ? 1 : 0)
-        var menuH = activeItemsCount * 32 + 12
+        var menuH = root.actionMenuHeight
         var targetTop = iconCenterY - menuH / 2
         return Math.round(Math.max(6, Math.min(screenH - menuH - 6, targetTop)))
     }
@@ -234,6 +236,46 @@ Item {
         return "ok"
     }
 
+    // Minimized window tracking (windows parked on the special:minimized workspace)
+    property var minimizedIds: []
+
+    Process {
+        id: minimizedProbe
+        property var pending: []
+        command: ["bash", "-c", "hyprctl clients -j | jq -r '.[] | select(.workspace.name == \"special:minimized\") | .class'; printf '\\n'"]
+        stdout: SplitParser {
+            onRead: function(line) {
+                var value = String(line).trim()
+                if (value && value.length > 0) {
+                    minimizedProbe.pending.push(value)
+                }
+            }
+        }
+        onExited: function(exitCode, exitStatus) {
+            var next = minimizedProbe.pending.slice()
+            minimizedProbe.pending = []
+            if (!root.arraysEqual(root.minimizedIds, next)) {
+                root.minimizedIds = next
+            }
+        }
+    }
+
+    function arraysEqual(a, b) {
+        if (!Array.isArray(a) || !Array.isArray(b)) return a === b
+        if (a.length !== b.length) return false
+        var set = {}
+        for (var i = 0; i < a.length; i++) set[a[i]] = true
+        for (var j = 0; j < b.length; j++) if (!set[b[j]]) return false
+        return true
+    }
+
+    function refreshMinimized() {
+        minimizedProbe.pending = []
+        minimizedProbe.running = true
+    }
+
+    onMinimizedIdsChanged: updateDockItems()
+
     // Pinned & Blacklist apps persistence
     property string userPinnedPath: Quickshell.env("HOME") + "/.config/omarchy/dock-pinned.json"
     property string userBlacklistPath: Quickshell.env("HOME") + "/.config/omarchy/dock-blacklist.json"
@@ -242,17 +284,93 @@ Item {
     property var dockItems: []
     property var appRows: (shell && shell.appLibrary) ? shell.appLibrary.sortedEntries("") : []
 
+    // Bar hidden state for "toggleWithBar"
+    property bool barHidden: false
+
+    Process {
+        id: barHiddenProbe
+        running: true
+        command: ["bash", "-c", "[[ -f $HOME/.local/state/omarchy/toggles/bar-off ]] && echo yes || echo no"]
+        stdout: SplitParser { onRead: function(line) { root.barHidden = String(line).trim() === "yes" } }
+    }
+    FileView {
+        id: barOffFile
+        path: Quickshell.env("HOME") + "/.local/state/omarchy/toggles/bar-off"
+        watchChanges: true
+        printErrors: false
+        onLoaded: barHiddenProbe.running = true
+        onLoadFailed: barHiddenProbe.running = true
+        onFileChanged: barHiddenProbe.running = true
+    }
+
+    Timer {
+        interval: 1000
+        repeat: true
+        running: true
+        onTriggered: {
+            barHiddenProbe.running = true
+            root.refreshMinimized()
+        }
+    }
+
     // Basic dock settings persistence (~/.config/omarchy/dock-settings.json)
     property string settingsPath: Quickshell.env("HOME") + "/.config/omarchy/dock-settings.json"
+    property string iconsPath: Quickshell.env("HOME") + "/.config/omarchy/dock-icons.json"
     property var dockSettings: DockModel.DEFAULT_SETTINGS
 
-    readonly property int dockItemSize: Number(dockSettings.itemSize) || 46
-    readonly property int dockIconSize: Number(dockSettings.iconSize) || 28
-    readonly property int dockPadding: Number(dockSettings.padding) || 6
-    readonly property real dockHoverScale: Number(dockSettings.hoverScale) || 1.12
-    readonly property real dockDragScale: Number(dockSettings.dragScale) || 1.22
-    readonly property real dockBackgroundOpacity: Number(dockSettings.backgroundOpacity) || 0.94
+    readonly property int dockItemSize: Number(dockSettings.itemSize) || 80
+    readonly property int dockIconSize: Number(dockSettings.iconSize) || 38
+    readonly property int dockPadding: Number(dockSettings.padding) || 48
+    readonly property real dockHoverScale: Number(dockSettings.hoverScale) || 2
+    readonly property real dockDragScale: Number(dockSettings.dragScale) || 2
+    readonly property real dockBackgroundOpacity: Number(dockSettings.backgroundOpacity) || 0.98
     readonly property bool dockShowRunningDots: dockSettings.showRunningDots !== false
+    readonly property bool dockShowTooltips: dockSettings.showTooltips !== false
+    readonly property bool dockToggleWithBar: dockSettings.toggleWithBar !== false
+    readonly property bool dockShowVisualizer: dockSettings.showVisualizer !== false
+    readonly property int dockVisualizerBars: Number(dockSettings.visualizerBars) || 32
+
+    // Cava audio visualizer process & data array
+    property var visualizerLevels: []
+
+    Process {
+        id: cavaProc
+        running: root.pluginEnabled && root.dockShowVisualizer
+        command: ["bash", "-c", "config_file=$(mktemp); trap 'rm -f \"$config_file\"' EXIT; echo -e '[general]\\nbars = " + root.dockVisualizerBars + "\\n[output]\\nmethod = raw\\nraw_target = /dev/stdout\\ndata_format = ascii\\nascii_max_range = 100' > \"$config_file\"; exec cava -p \"$config_file\""]
+        stdout: SplitParser {
+            onRead: function(line) {
+                var text = String(line).trim()
+                if (!text) return
+                var parts = text.split(";")
+                var nums = []
+                for (var i = 0; i < parts.length; i++) {
+                    var n = Number(parts[i])
+                    if (!isNaN(n)) {
+                        nums.push(n / 100.0)
+                    }
+                }
+                if (nums.length > 0) {
+                    root.visualizerLevels = nums
+                }
+            }
+        }
+    }
+
+    // Currently hovered item tracking for tooltips
+    property var hoveredItemData: null
+    property int hoveredItemIndex: -1
+
+    Timer {
+        id: tooltipDelayTimer
+        interval: Number(dockSettings.showTooltipsDelay) || 350
+        repeat: false
+        property var pendingData: null
+        property int pendingIndex: -1
+        onTriggered: {
+            root.hoveredItemData = pendingData
+            root.hoveredItemIndex = pendingIndex
+        }
+    }
 
     // Derived dock card geometry (itemSize slots + padding, 2px antialiasing buffer)
     readonly property real dockWindowThickness: dockItemSize + 2
@@ -266,7 +384,9 @@ Item {
         var toplevels = ToplevelManager.toplevels ? ToplevelManager.toplevels.values : []
         var active = ToplevelManager.activeToplevel
         var lib = shell ? shell.appLibrary : null
-        root.dockItems = DockModel.buildDockItems(root.pinnedIds, root.blacklistIds, toplevels, active, root.appRows, lib)
+        var fws = Hyprland.focusedWorkspace ? Hyprland.focusedWorkspace.id : undefined
+        var fmon = Hyprland.focusedMonitor ? Hyprland.focusedMonitor.name : ""
+        root.dockItems = DockModel.buildDockItems(root.pinnedIds, root.blacklistIds, toplevels, active, root.appRows, lib, root.minimizedIds, fws, fmon)
     }
 
     onPinnedIdsChanged: updateDockItems()
@@ -285,6 +405,12 @@ Item {
     Connections {
         target: ToplevelManager
         function onActiveToplevelChanged() { root.updateDockItems() }
+    }
+
+    Connections {
+        target: Hyprland
+        function onFocusedWorkspaceChanged() { root.updateDockItems() }
+        function onFocusedMonitorChanged() { root.updateDockItems() }
     }
 
     Connections {
@@ -350,6 +476,35 @@ Item {
         onFileChanged: userSettingsFile.reload()
     }
 
+    // Custom per-app icon overrides persistence (~/.config/omarchy/dock-icons.json)
+    FileView {
+        id: userIconsFile
+        path: root.iconsPath
+        watchChanges: true
+        atomicWrites: true
+        printErrors: false
+        onLoaded: {
+            var overrides = null
+            try {
+                overrides = JSON.parse(text() || "{}")
+            } catch(e) {
+                overrides = {}
+            }
+            IconResolver.loadCustomIcons(overrides)
+            root.updateDockItems()
+        }
+        onLoadFailed: {
+            IconResolver.loadCustomIcons({})
+            root.saveCustomIcons()
+        }
+        onFileChanged: userIconsFile.reload()
+    }
+
+    function saveCustomIcons() {
+        var json = JSON.stringify(IconResolver.allCustomIcons(), null, 2)
+        userIconsFile.setText(json + "\n")
+    }
+
     function saveSettings() {
         var json = DockModel.serializeSettings(root.dockSettings)
         userSettingsFile.setText(json + "\n")
@@ -377,8 +532,116 @@ Item {
         root.updateDockItems()
     }
 
-    readonly property var activeToplevel: ToplevelManager.activeToplevel
-    onActiveToplevelChanged: refreshClients()
+    // Minimize an app to the dock (park all its windows on the special:minimized workspace)
+    function minimizeItem(item) {
+        if (!item || !item.appId) return
+        var metas = (item.windows && item.windows.length) ? item.windows : []
+        var dispatched = false
+        for (var i = 0; i < metas.length; i++) {
+            var addr = metas[i] ? metas[i].address : ""
+            if (!addr) continue
+            var lua = 'hl.dsp.window.move({ workspace = "special:minimized", follow = false, window = "address:' + addr + '" })'
+            Util.execDetached("hyprctl dispatch " + Util.shellQuote(lua))
+            dispatched = true
+        }
+        if (!dispatched) {
+            // Fallback: no per-window addresses available — move the first matching window by class
+            var luaFallback = 'hl.dsp.window.move({ workspace = "special:minimized", follow = false, window = "class:' + item.appId + '" })'
+            Util.execDetached("hyprctl dispatch " + Util.shellQuote(luaFallback))
+        }
+        root.refreshMinimized()
+    }
+
+    // Restore a minimized app back to the current workspace and focus one of its windows
+    function restoreItem(item) {
+        if (!item || !item.appId) return
+        var script = "ACTIVE=$(hyprctl activeworkspace -j | jq -r .id); "
+            + "ADDRS=$(hyprctl clients -j | jq -r '.[] | select(.workspace.name == \"special:minimized\" and .class == \""
+            + item.appId + "\") | .address'); "
+            + "last=\"\"; "
+            + "for addr in $ADDRS; do "
+            + "last=\"$addr\"; "
+            + "hyprctl dispatch \"hl.dsp.window.move({ workspace = $ACTIVE, follow = false, window = \\\"address:$addr\\\" })\" >/dev/null 2>&1; "
+            + "done; "
+            + "if [ -n \"$last\" ]; then "
+            + "hyprctl dispatch \"hl.dsp.window.move({ workspace = $ACTIVE, follow = true, window = \\\"address:$last\\\" })\" >/dev/null 2>&1; "
+            + "fi"
+        Util.execDetached("bash -c " + Util.shellQuote(script))
+        root.refreshMinimized()
+    }
+
+    // Launch a fresh instance of an app (used by middle-click and the action card)
+    function launchApp(item) {
+        if (!item || !item.appId) return
+        if (root.shell && root.shell.appLibrary && typeof root.shell.appLibrary.launch === "function") {
+            root.shell.appLibrary.launch(item.appId, item.name)
+        } else {
+            var target = item.appId ? (item.appId + ".desktop") : (item.exec + ".desktop")
+            Util.execDetached("uwsm-app -- gtk-launch " + Util.shellQuote(target) + " || uwsm-app -- " + item.exec)
+        }
+    }
+
+    // Activate a specific window from the window list
+    function activateWindow(meta) {
+        if (!meta || !meta.toplevel) return
+        if (meta.toplevel.activate) meta.toplevel.activate()
+        root.activeMenuItem = null
+    }
+
+    // Close a single window (per-window ✕ / "Close Window" action)
+    function closeWindow(meta) {
+        if (!meta || !meta.toplevel) return
+        if (meta.toplevel.close) meta.toplevel.close()
+        root.activeMenuItem = null
+    }
+
+    // Close every window of an app ("Close All Windows" action)
+    function closeAllWindows(item) {
+        if (!item || !item.toplevels) return
+        for (var t = 0; t < item.toplevels.length; t++) {
+            if (item.toplevels[t].close) item.toplevels[t].close()
+        }
+        root.activeMenuItem = null
+    }
+
+    // Active window of an app (falls back to the first listed window)
+    function activeWindowOf(item) {
+        if (!item || !item.windows) return null
+        var wins = item.windows
+        for (var i = 0; i < wins.length; i++) {
+            if (wins[i].active) return wins[i]
+        }
+        return wins.length > 0 ? wins[0] : null
+    }
+
+    // Scrollable window-list rows (capped at 8)
+    readonly property int winListRows: {
+        var item = root.activeMenuItem
+        if (!item || !item.isRunning || !item.windows) return 0
+        return Math.max(1, Math.min(8, item.windows.length))
+    }
+
+    // Total action-card height accounting for the window list (exact ColumnLayout fit)
+    readonly property real actionMenuHeight: {
+        var item = root.activeMenuItem
+        var sum = 32 * 3 // pin, new window, icon
+        var n = 3
+        if (item && item.isRunning) {
+            sum += 32 // close window
+            n += 1
+            if (item.windowCount > 1) {
+                sum += 32 // close all windows
+                n += 1
+            }
+            sum += 32 // minimize
+            n += 1
+            sum += 26 // "Windows" header
+            n += 1
+            sum += root.winListRows * 26 // window list
+            n += 1
+        }
+        return sum + (n - 1) * 2 + 4
+    }
 
     Component.onCompleted: {
         root.dockSettings = DockModel.parseSettings(userSettingsFile.text() || "")
@@ -386,6 +649,7 @@ Item {
         root.blacklistIds = DockModel.parseBlacklist(userBlacklistFile.text() || "")
         refreshLayers()
         updatePluginEnabled()
+        refreshMinimized()
         updateDockItems()
     }
 
@@ -393,9 +657,12 @@ Item {
 
     // Outside-click dismissal for the action menu
     HyprlandFocusGrab {
-        active: root.isMenuOpen
-        windows: [menuWindow, dockWindow]
-        onCleared: root.activeMenuItem = null
+        active: root.isMenuOpen || root.isDockMenuOpen
+        windows: [menuWindow, dockMenuWindow, dockWindow]
+        onCleared: {
+            root.activeMenuItem = null
+            root.isDockMenuOpen = false
+        }
     }
 
     // 1. The Main Solid Dock Window (Permanent, strictly 46px height/width, 100% jitter-free)
@@ -405,7 +672,7 @@ Item {
 
         WlrLayershell.namespace: "omarchy-dock"
         WlrLayershell.layer: WlrLayer.Top
-        exclusionMode: (root.opened && root.pluginEnabled && visible) ? ExclusionMode.Auto : ExclusionMode.Ignore
+        exclusionMode: (root.opened && root.pluginEnabled && visible && (!root.dockToggleWithBar || !root.barHidden)) ? ExclusionMode.Auto : ExclusionMode.Ignore
         color: "transparent"
 
         anchors {
@@ -416,10 +683,10 @@ Item {
         }
 
         margins {
-            bottom: (!root.isVertical && root.barPosition === "top") ? (Style.gapsOut || 5) : 0
-            top: (!root.isVertical && root.barPosition === "bottom") ? (Style.gapsOut || 5) : 0
-            right: (root.isVertical && root.barPosition === "left") ? (Style.gapsOut || 5) : 0
-            left: (root.isVertical && root.barPosition === "right") ? (Style.gapsOut || 5) : 0
+            bottom: (!root.isVertical && root.barPosition === "top") ? ((root.dockToggleWithBar && root.barHidden) ? -(root.dockWindowThickness + 10) : (Style.gapsOut || 5)) : 0
+            top: (!root.isVertical && root.barPosition === "bottom") ? ((root.dockToggleWithBar && root.barHidden) ? -(root.dockWindowThickness + 10) : (Style.gapsOut || 5)) : 0
+            right: (root.isVertical && root.barPosition === "left") ? ((root.dockToggleWithBar && root.barHidden) ? -(root.dockWindowThickness + 10) : (Style.gapsOut || 5)) : 0
+            left: (root.isVertical && root.barPosition === "right") ? ((root.dockToggleWithBar && root.barHidden) ? -(root.dockWindowThickness + 10) : (Style.gapsOut || 5)) : 0
         }
 
         // Exact, uncompromised dock dimensions with 2px antialiasing buffer
@@ -432,7 +699,7 @@ Item {
             anchors.centerIn: parent
             width: root.isVertical ? root.dockSurfaceThickness : root.dockSurfaceLength
             height: root.isVertical ? root.dockSurfaceLength : root.dockSurfaceThickness
-            visible: root.opened && root.pluginEnabled && !remapTimer.running
+            visible: root.opened && root.pluginEnabled && (!root.dockToggleWithBar || !root.barHidden) && !remapTimer.running
 
             color: Color.composed("bar.background", "bar.background-alpha", Color.background, root.dockBackgroundOpacity)
             border.width: root.systemBorderSize
@@ -445,11 +712,58 @@ Item {
             Behavior on border.color { ColorAnimation { duration: 250 } }
             Behavior on radius { NumberAnimation { duration: 250 } }
 
+            // Blank space mouse area for right-click context menu
+            MouseArea {
+                anchors.fill: parent
+                acceptedButtons: Qt.LeftButton | Qt.RightButton
+                onClicked: function(mouse) {
+                    if (mouse.button === Qt.RightButton) {
+                        root.activeMenuItem = null
+                        root.isDockMenuOpen = !root.isDockMenuOpen
+                    } else {
+                        root.activeMenuItem = null
+                        root.isDockMenuOpen = false
+                    }
+                }
+            }
+
+            // Audio Visualizer Backdrop
+            Item {
+                id: visualizerBackdrop
+                anchors.fill: parent
+                anchors.margins: root.systemBorderSize + 2
+                z: 0
+                visible: root.dockShowVisualizer
+
+                Row {
+                    anchors.fill: parent
+                    spacing: 2
+                    opacity: 0.25
+
+                    Repeater {
+                        model: root.visualizerLevels
+                        delegate: Rectangle {
+                            required property var modelData
+                            width: (parent.width - (root.visualizerLevels.length - 1) * 2) / root.visualizerLevels.length
+                            height: parent.height * Math.max(0.05, modelData)
+                            anchors.bottom: parent.bottom
+                            color: Color.accent
+                            radius: 2
+
+                            Behavior on height {
+                                NumberAnimation { duration: 50 }
+                            }
+                        }
+                    }
+                }
+            }
+
             Item {
                 id: dockContent
                 anchors.centerIn: parent
                 width: root.isVertical ? root.dockContentThickness : root.dockContentLength
                 height: root.isVertical ? root.dockContentLength : root.dockContentThickness
+                z: 1
 
                 Repeater {
                     model: root.dockItems
@@ -469,11 +783,57 @@ Item {
                         systemRounding: root.systemRounding
                         isSelected: root.activeMenuItem && root.activeMenuItem.appClass === modelData.appClass
 
+                        // Update tooltip tracked index and data on hover
+                        onContainsMouseChanged: {
+                            if (containsMouse) {
+                                if (!isDragging) {
+                                    tooltipDelayTimer.stop()
+                                    tooltipDelayTimer.pendingData = modelData
+                                    tooltipDelayTimer.pendingIndex = index
+                                    if (root.hoveredItemData !== null) {
+                                        // If another tooltip is already visible, switch immediately without delay
+                                        root.hoveredItemData = modelData
+                                        root.hoveredItemIndex = index
+                                    } else {
+                                        tooltipDelayTimer.restart()
+                                    }
+                                }
+                            } else {
+                                if (tooltipDelayTimer.pendingIndex === index) {
+                                    tooltipDelayTimer.stop()
+                                    tooltipDelayTimer.pendingData = null
+                                    tooltipDelayTimer.pendingIndex = -1
+                                }
+                                if (root.hoveredItemIndex === index) {
+                                    root.hoveredItemData = null
+                                    root.hoveredItemIndex = -1
+                                }
+                            }
+                        }
+
+                        onIsDraggingChanged: {
+                            if (isDragging) {
+                                tooltipDelayTimer.stop()
+                                tooltipDelayTimer.pendingData = null
+                                tooltipDelayTimer.pendingIndex = -1
+                                root.hoveredItemData = null
+                                root.hoveredItemIndex = -1
+                            }
+                        }
+
                         x: root.isVertical ? 0 : (index * root.dockItemSize)
                         y: root.isVertical ? (index * root.dockItemSize) : 0
 
                         onItemLeftClicked: function(item) {
                             root.activeMenuItem = null
+                            if (item && item.isMinimized) {
+                                root.restoreItem(item)
+                            }
+                        }
+
+                        onNewWindowRequested: function(item) {
+                            root.activeMenuItem = null
+                            root.launchApp(item)
                         }
 
                         onItemRightClicked: function(item, targetItem) {
@@ -492,6 +852,87 @@ Item {
                 }
             }
         }
+    }
+
+    // 2. Hover Tooltip (Shown when hovering over an icon, floats cleanly above/below/beside dock depending on barPosition)
+    PanelWindow {
+        id: tooltipWindow
+        visible: root.dockShowTooltips && root.hoveredItemData !== null && !root.isMenuOpen
+
+        WlrLayershell.namespace: "omarchy-dock-tooltip"
+        WlrLayershell.layer: WlrLayer.Overlay
+        exclusionMode: ExclusionMode.Ignore
+        color: "transparent"
+
+        anchors {
+            top: root.barPosition === "bottom" ? true : (root.isVertical ? true : false)
+            bottom: root.barPosition === "top" ? true : false
+            left: root.barPosition === "right" ? true : (!root.isVertical ? true : false)
+            right: root.barPosition === "left" ? true : false
+        }
+
+        margins {
+            // Match the floating distance above/below/beside the main dock
+            bottom: (!root.isVertical && root.barPosition === "top") ? ((Style.gapsOut || 5) + root.dockItemSize + 4) : 0
+            top: (!root.isVertical && root.barPosition === "bottom") ? ((Style.gapsOut || 5) + root.dockItemSize + 4) : (root.isVertical ? root.calculatedTooltipTop : 0)
+            right: (root.isVertical && root.barPosition === "left") ? ((Style.gapsOut || 5) + root.dockItemSize + 4) : 0
+            left: (root.isVertical && root.barPosition === "right") ? ((Style.gapsOut || 5) + root.dockItemSize + 4) : (!root.isVertical ? root.calculatedTooltipLeft : 0)
+        }
+
+        implicitWidth: tooltipBubble.width
+        implicitHeight: tooltipBubble.height
+
+        Rectangle {
+            id: tooltipBubble
+            width: tooltipLabel.implicitWidth + 24
+            height: tooltipLabel.implicitHeight + 12
+            color: Color.composed("popups.background", "popups.background-alpha", Color.background, 0.95)
+            border.width: root.systemBorderSize
+            border.color: Color.accent
+            radius: Math.min(8, root.systemRounding)
+            antialiasing: true
+            smooth: true
+
+            Text {
+                id: tooltipLabel
+                anchors.centerIn: parent
+                text: {
+                    if (!root.hoveredItemData) return ""
+                    var base = root.hoveredItemData.name
+                    if (root.hoveredItemData.windowCount > 1) {
+                        base += " — " + root.hoveredItemData.windowCount + " windows"
+                    }
+                    return base
+                }
+                font.family: Style.font.family
+                font.pixelSize: 12
+                font.bold: true
+                color: Color.popups.text
+            }
+        }
+    }
+
+    // Exact geometric coordinate centering for the tooltip bubble
+    readonly property real calculatedTooltipLeft: {
+        var screenW = dockWindow.screen ? dockWindow.screen.width : 1920
+        var dockW = root.isVertical ? root.dockWindowThickness : root.dockSurfaceLength
+        var dockLeft = (screenW - dockW) / 2
+        var iconCenterX = root.isVertical
+            ? dockLeft + root.dockWindowThickness / 2
+            : dockLeft + (root.dockWindowLength - root.dockContentLength) / 2 + root.hoveredItemIndex * root.dockItemSize + (root.dockItemSize - 4) / 2
+        var targetLeft = iconCenterX - tooltipBubble.width / 2
+        return Math.round(Math.max(6, Math.min(screenW - tooltipBubble.width - 6, targetLeft)))
+    }
+
+    readonly property real calculatedTooltipTop: {
+        var screenH = dockWindow.screen ? dockWindow.screen.height : 1080
+        var dockH = root.isVertical ? root.dockSurfaceLength : root.dockWindowThickness
+        var dockTop = (screenH - dockH) / 2
+        var iconCenterY = root.isVertical
+            ? dockTop + (root.dockWindowLength - root.dockContentLength) / 2 + root.hoveredItemIndex * root.dockItemSize + (root.dockItemSize - 4) / 2
+            : dockTop + root.dockWindowThickness / 2
+        var targetTop = iconCenterY - tooltipBubble.height / 2
+        return Math.round(Math.max(6, Math.min(screenH - tooltipBubble.height - 6, targetTop)))
     }
 
     // 2. The Isolated Action Card Popup Overlay Window (Floats strictly centered over the clicked icon)
@@ -518,20 +959,14 @@ Item {
             left: (root.isVertical && root.barPosition === "right") ? ((Style.gapsOut || 5) + 52) : (!root.isVertical ? root.calculatedMenuLeft : 0)
         }
 
-        implicitWidth: 180
-        implicitHeight: {
-            var count = 3 + (root.activeMenuItem && root.activeMenuItem.isRunning ? 1 : 0)
-            return count * 32 + 12
-        }
+        implicitWidth: 260
+        implicitHeight: root.actionMenuHeight
 
         // Visual Action Card
         Rectangle {
             anchors.centerIn: parent
-            width: 172
-            height: {
-                var count = 3 + (root.activeMenuItem && root.activeMenuItem.isRunning ? 1 : 0)
-                return count * 32 + 4
-            }
+            width: 252
+            height: root.actionMenuHeight
             color: Color.composed("popups.background", "popups.background-alpha", Color.background, 0.96)
             border.width: root.systemBorderSize
             border.color: Color.accent
@@ -629,14 +1064,7 @@ Item {
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
                         onClicked: {
-                            if (root.activeMenuItem) {
-                                if (root.shell && root.shell.appLibrary && typeof root.shell.appLibrary.launch === "function") {
-                                    root.shell.appLibrary.launch(root.activeMenuItem.appId, root.activeMenuItem.name)
-                                } else {
-                                    var target = root.activeMenuItem.appId ? (root.activeMenuItem.appId + ".desktop") : (root.activeMenuItem.exec + ".desktop")
-                                    Util.execDetached("uwsm-app -- gtk-launch " + Util.shellQuote(target) + " || uwsm-app -- " + root.activeMenuItem.exec)
-                                }
-                            }
+                            root.launchApp(root.activeMenuItem)
                             root.activeMenuItem = null
                         }
                     }
@@ -680,12 +1108,228 @@ Item {
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
                         onClicked: {
-                            if (root.activeMenuItem && root.activeMenuItem.toplevels) {
-                                for (var t = 0; t < root.activeMenuItem.toplevels.length; t++) {
-                                    if (root.activeMenuItem.toplevels[t].close) root.activeMenuItem.toplevels[t].close()
-                                }
+                            root.closeWindow(root.activeWindowOf(root.activeMenuItem))
+                        }
+                    }
+                }
+
+                // ✕✕ Close All Windows Item (if running with multiple windows)
+                Rectangle {
+                    visible: root.activeMenuItem && root.activeMenuItem.isRunning && root.activeMenuItem.windowCount > 1
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: visible ? 32 : 0
+                    radius: Math.min(6, root.systemRounding)
+                    color: closeAllMouse.containsMouse ? Style.hoverFillFor(Color.urgent, Color.urgent) : "transparent"
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 10
+                        anchors.rightMargin: 10
+                        spacing: 10
+
+                        Text {
+                            text: "✕✕"
+                            font.family: Style.font.family
+                            font.pixelSize: 11
+                            font.bold: true
+                            color: closeAllMouse.containsMouse ? Color.urgent : Color.muted
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: "Close All Windows"
+                            font.family: Style.font.family
+                            font.pixelSize: 13
+                            color: closeAllMouse.containsMouse ? Color.urgent : Color.popups.text
+                            elide: Text.ElideRight
+                        }
+                    }
+
+                    MouseArea {
+                        id: closeAllMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            root.closeAllWindows(root.activeMenuItem)
+                        }
+                    }
+                }
+
+                // 🗕 Minimize Window Item (if running)
+                Rectangle {
+                    visible: root.activeMenuItem && root.activeMenuItem.isRunning
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: visible ? 32 : 0
+                    radius: Math.min(6, root.systemRounding)
+                    color: minMouse.containsMouse ? Style.hoverFillFor(Color.popups.text, Color.accent) : "transparent"
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 10
+                        anchors.rightMargin: 10
+                        spacing: 10
+
+                        Text {
+                            text: "🗕"
+                            font.family: Style.font.family
+                            font.pixelSize: 11
+                            font.bold: true
+                            color: minMouse.containsMouse ? Color.accent : Color.muted
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: "Minimize to Dock"
+                            font.family: Style.font.family
+                            font.pixelSize: 13
+                            color: minMouse.containsMouse ? Color.accent : Color.popups.text
+                            elide: Text.ElideRight
+                        }
+                    }
+
+                    MouseArea {
+                        id: minMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            if (root.activeMenuItem && root.activeMenuItem.appId) {
+                                root.minimizeItem(root.activeMenuItem)
                             }
                             root.activeMenuItem = null
+                        }
+                    }
+                }
+
+                // Windows List Header (if running)
+                Rectangle {
+                    visible: root.activeMenuItem && root.activeMenuItem.isRunning
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: visible ? 26 : 0
+                    color: "transparent"
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 10
+                        anchors.rightMargin: 10
+                        spacing: 8
+
+                        Text {
+                            text: "Windows"
+                            font.family: Style.font.family
+                            font.pixelSize: 10
+                            font.bold: true
+                            color: Color.muted
+                        }
+
+                        Rectangle {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 1
+                            Layout.alignment: Qt.AlignVCenter
+                            color: Color.composed("bar.text", "bar.text-alpha", Color.bar.text, 0.15)
+                        }
+
+                        Text {
+                            text: root.activeMenuItem ? String(root.activeMenuItem.windowCount) : ""
+                            font.family: Style.font.family
+                            font.pixelSize: 10
+                            color: Color.muted
+                        }
+                    }
+                }
+
+                // Scrollable Window List (if running)
+                Item {
+                    visible: root.activeMenuItem && root.activeMenuItem.isRunning
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: visible ? root.winListRows * 26 : 0
+
+                    ListView {
+                        id: winListView
+                        anchors.fill: parent
+                        anchors.rightMargin: 4
+                        model: (root.activeMenuItem && root.activeMenuItem.windows) || []
+                        clip: true
+                        interactive: root.activeMenuItem && root.activeMenuItem.windows.length > root.winListRows
+                        boundsBehavior: Flickable.StopAtBounds
+
+                        delegate: Rectangle {
+                            required property var modelData
+                            readonly property bool isActiveWin: modelData && modelData.active === true
+                            readonly property bool rowHover: winRowArea.containsMouse
+                            width: winListView.width
+                            height: 26
+                            radius: 5
+                            color: rowHover ? Style.hoverFillFor(Color.popups.text, Color.accent) : (isActiveWin ? Color.composed("accent", "accent-alpha", Color.accent, 0.16) : "transparent")
+
+                            MouseArea {
+                                id: winRowArea
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.activateWindow(modelData)
+                            }
+
+                            RowLayout {
+                                anchors.fill: parent
+                                anchors.leftMargin: 8
+                                anchors.rightMargin: 4
+                                spacing: 6
+
+                                Text {
+                                    text: modelData && modelData.workspaceName ? "[" + modelData.workspaceName + "]" : ""
+                                    font.family: Style.font.family
+                                    font.pixelSize: 9
+                                    color: Color.muted
+                                }
+
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: (modelData && modelData.title) ? modelData.title : "(untitled)"
+                                    font.family: Style.font.family
+                                    font.pixelSize: 12
+                                    elide: Text.ElideRight
+                                    color: isActiveWin ? Color.accent : Color.popups.text
+                                }
+
+                                Rectangle {
+                                    visible: winRowArea.containsMouse
+                                    width: 16
+                                    height: 16
+                                    radius: 8
+                                    color: closeWinArea.containsMouse ? Color.urgent : Style.hoverFillFor(Color.popups.text, Color.accent)
+
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "✕"
+                                        font.family: Style.font.family
+                                        font.pixelSize: 9
+                                        font.bold: true
+                                        color: closeWinArea.containsMouse ? Color.background : Color.popups.text
+                                    }
+
+                                    MouseArea {
+                                        id: closeWinArea
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: root.closeWindow(modelData)
+                                    }
+                                }
+                            }
+                        }
+
+                        // Thin accent scrollbar (only when content overflows)
+                        Rectangle {
+                            id: winScrollBar
+                            visible: winListView.contentHeight > winListView.height
+                            width: 3
+                            height: Math.max(12, winListView.height * (winListView.height / winListView.contentHeight))
+                            x: winListView.width - 3
+                            y: winListView.contentY * (winListView.height / winListView.contentHeight)
+                            radius: 1.5
+                            color: Color.composed("bar.text", "bar.text-alpha", Color.bar.text, 0.45)
                         }
                     }
                 }
@@ -732,6 +1376,139 @@ Item {
                                 iconInputDialog.visible = true
                             }
                             root.activeMenuItem = null
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Blank Space Context Menu Window
+    PanelWindow {
+        id: dockMenuWindow
+        visible: root.isDockMenuOpen && root.opened && root.pluginEnabled
+
+        WlrLayershell.namespace: "omarchy-dock-menu"
+        WlrLayershell.layer: WlrLayer.Overlay
+        exclusionMode: ExclusionMode.Ignore
+        color: "transparent"
+
+        anchors {
+            top: root.barPosition === "bottom" ? true : (root.isVertical ? true : false)
+            bottom: root.barPosition === "top" ? true : false
+            left: root.barPosition === "right" ? true : (!root.isVertical ? true : false)
+            right: root.barPosition === "left" ? true : false
+        }
+
+        margins {
+            bottom: (!root.isVertical && root.barPosition === "top") ? ((Style.gapsOut || 5) + 52) : 0
+            top: (!root.isVertical && root.barPosition === "bottom") ? ((Style.gapsOut || 5) + 52) : (root.isVertical ? root.calculatedMenuTop : 0)
+            right: (root.isVertical && root.barPosition === "left") ? ((Style.gapsOut || 5) + 52) : 0
+            left: (root.isVertical && root.barPosition === "right") ? ((Style.gapsOut || 5) + 52) : (!root.isVertical ? root.calculatedMenuLeft : 0)
+        }
+
+        implicitWidth: 260
+        implicitHeight: 2 * 32 + 16
+
+        Rectangle {
+            anchors.centerIn: parent
+            width: 252
+            height: 2 * 32 + 8
+            color: Color.composed("popups.background", "popups.background-alpha", Color.background, 0.96)
+            border.width: root.systemBorderSize
+            border.color: Color.accent
+            radius: Math.min(10, root.systemRounding)
+            antialiasing: true
+            smooth: true
+
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 2
+                spacing: 2
+
+                // 👁 Toggle with Top Bar Item
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 32
+                    radius: Math.min(6, root.systemRounding)
+                    color: tglBarMouse.containsMouse ? Style.hoverFillFor(Color.popups.text, Color.accent) : "transparent"
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 10
+                        anchors.rightMargin: 10
+                        spacing: 10
+
+                        Text {
+                            text: root.dockToggleWithBar ? "✓" : "○"
+                            font.family: Style.font.family
+                            font.pixelSize: 13
+                            font.bold: true
+                            color: root.dockToggleWithBar ? Color.accent : (tglBarMouse.containsMouse ? Color.accent : Color.popups.text)
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: "Toggle with Top Bar"
+                            font.family: Style.font.family
+                            font.pixelSize: 13
+                            color: tglBarMouse.containsMouse ? Color.accent : Color.popups.text
+                            elide: Text.ElideRight
+                        }
+                    }
+
+                    MouseArea {
+                        id: tglBarMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            root.dockSettings.toggleWithBar = !root.dockToggleWithBar
+                            root.saveSettings()
+                            root.updateDockItems()
+                            root.isDockMenuOpen = false
+                        }
+                    }
+                }
+
+                // ⚙ Configure Dock Settings
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 32
+                    radius: Math.min(6, root.systemRounding)
+                    color: cfgMouse.containsMouse ? Style.hoverFillFor(Color.popups.text, Color.accent) : "transparent"
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 10
+                        anchors.rightMargin: 10
+                        spacing: 10
+
+                        Text {
+                            text: "⚙"
+                            font.family: Style.font.family
+                            font.pixelSize: 13
+                            color: cfgMouse.containsMouse ? Color.accent : Color.popups.text
+                        }
+
+                        Text {
+                            Layout.fillWidth: true
+                            text: "Configure Dock"
+                            font.family: Style.font.family
+                            font.pixelSize: 13
+                            color: cfgMouse.containsMouse ? Color.accent : Color.popups.text
+                            elide: Text.ElideRight
+                        }
+                    }
+
+                    MouseArea {
+                        id: cfgMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: {
+                            Util.execDetached("uwsm-app -- ${EDITOR:-micro} " + Util.shellQuote(root.settingsPath) + " || ${EDITOR:-micro} " + Util.shellQuote(root.settingsPath) + " || xdg-open " + Util.shellQuote(root.settingsPath))
+                            root.isDockMenuOpen = false
                         }
                     }
                 }
@@ -860,6 +1637,7 @@ Item {
                             onClicked: {
                                 if (iconInputDialog.targetItem && iconInputDialog.targetItem.appId) {
                                     IconResolver.setCustomIcon(iconInputDialog.targetItem.appId, iconInputText.text)
+                                    root.saveCustomIcons()
                                     root.updateDockItems()
                                 }
                                 iconInputDialog.visible = false

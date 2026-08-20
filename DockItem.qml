@@ -4,6 +4,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "DockModel.js" as DockModel
 import "IconResolver.js" as IconResolver
 
 Item {
@@ -24,10 +25,12 @@ Item {
     property int systemBorderSize: 2
     property int systemRounding: 12
     property bool isSelected: false
+    readonly property bool containsMouse: mouseArea.containsMouse
 
     signal moveRequested(int fromIdx, int toIdx)
     signal itemRightClicked(var item, var targetItem)
     signal itemLeftClicked(var item)
+    signal newWindowRequested(var item)
 
     implicitWidth: root.dockItemSize - 4
     implicitHeight: root.dockItemSize - 4
@@ -44,7 +47,7 @@ Item {
 
         // Smooth subtle hover and drag zoom
         scale: root.isDragging ? root.dragScale : (mouseArea.containsMouse ? root.hoverScale : 1.0)
-        opacity: root.isDragging ? 0.92 : 1.0
+        opacity: root.isDragging ? 0.92 : (root.itemData && root.itemData.isMinimized ? 0.55 : 1.0)
         Behavior on scale { NumberAnimation { duration: 130; easing.type: Easing.OutCubic } }
         Behavior on opacity { NumberAnimation { duration: 130; easing.type: Easing.OutCubic } }
 
@@ -63,21 +66,25 @@ Item {
 
             source: {
                 if (!root.itemData) return ""
+                // Priority: explicit user override, then the already-resolved
+                // itemData.icon (appLibrary.iconSource(entry.icon)), then the
+                // heuristic resolution, then raw app identifiers.
+                var custom = IconResolver.getCustomIcon(root.itemData.appId)
+                var iconName = custom || root.itemData.icon || ""
                 var resolved = IconResolver.resolveIcon(root.itemData.appClass, root.itemData.icon, root.itemData.appId)
-                if (root.shell && root.shell.appLibrary && typeof root.shell.appLibrary.iconSource === "function") {
-                    var s = root.shell.appLibrary.iconSource(resolved)
-                    if (s && s.length > 0) return s
-                    s = root.shell.appLibrary.iconSource(root.itemData.appClass)
-                    if (s && s.length > 0) return s
-                    s = root.shell.appLibrary.iconSource(root.itemData.appId)
-                    if (s && s.length > 0) return s
+                var candidates = [iconName]
+                if (resolved && resolved !== iconName) candidates.push(resolved)
+                candidates.push(root.itemData.appClass, root.itemData.appId)
+                for (var i = 0; i < candidates.length; i++) {
+                    var s = ""
+                    if (root.shell && root.shell.appLibrary && typeof root.shell.appLibrary.iconSource === "function") {
+                        s = root.shell.appLibrary.iconSource(candidates[i])
+                    }
+                    if (!s || s.length === 0) {
+                        s = Quickshell.iconPath(candidates[i], true)
+                    }
+                    if (s && s.length > 0 && s.indexOf("application-x-executable") === -1) return s
                 }
-                var p = Quickshell.iconPath(resolved, true)
-                if (p && p.length > 0) return p
-                p = Quickshell.iconPath(root.itemData.appClass, true)
-                if (p && p.length > 0) return p
-                p = Quickshell.iconPath(root.itemData.appId, true)
-                if (p && p.length > 0) return p
                 return Quickshell.iconPath("application-x-executable", true)
             }
 
@@ -102,35 +109,58 @@ Item {
         }
     }
 
-    // Running Indicator Dot (Always strictly under icon in all orientations, fades on hover)
-    Rectangle {
-        id: runningDot
+    // Running Indicator Dots (one per open window, active window highlighted, always under icon, fades on hover)
+    Row {
+        id: runningDots
         visible: opacity > 0
         opacity: (root.showRunningDots && root.itemData && root.itemData.isRunning && !mouseArea.containsMouse && !root.isDragging) ? 1.0 : 0.0
 
         Behavior on opacity { NumberAnimation { duration: 130; easing.type: Easing.OutCubic } }
 
-        width: root.itemData && root.itemData.isActive ? 4 : 3
-        height: root.itemData && root.itemData.isActive ? 4 : 3
-        radius: width / 2
-        color: root.itemData && root.itemData.isActive ? Color.accent : Color.composed("bar.text", "bar.text-alpha", Color.bar.text, 0.75)
-        antialiasing: true
-        smooth: true
-
-        // Unified positioning: ALWAYS under icon across all orientations
+        spacing: 2
         anchors.top: iconWrapper.bottom
         anchors.topMargin: 2
         anchors.horizontalCenter: parent.horizontalCenter
 
-        Behavior on color { ColorAnimation { duration: 180 } }
-        Behavior on width { NumberAnimation { duration: 180 } }
+        Repeater {
+            model: {
+                if (!root.itemData || !root.itemData.isRunning) return 0
+                var w = root.itemData.windows || []
+                var n = w.length > 0 ? w.length : root.itemData.windowCount
+                if (n < 1) n = 1
+                return Math.min(5, n)
+            }
+
+            Rectangle {
+                width: 3
+                height: 3
+                radius: width / 2
+                color: {
+                    var w = (root.itemData && root.itemData.windows) || []
+                    var meta = w.length > index ? w[index] : null
+                    return (meta && meta.active) ? Color.accent : Color.composed("bar.text", "bar.text-alpha", Color.bar.text, 0.75)
+                }
+                antialiasing: true
+                smooth: true
+                Behavior on color { ColorAnimation { duration: 180 } }
+            }
+        }
+
+        Text {
+            visible: (root.itemData && root.itemData.isRunning === true && Number(root.itemData.windowCount) > 5) === true
+            text: root.itemData ? ("+" + (root.itemData.windowCount - 5)) : ""
+            font.family: Style.font.family
+            font.pixelSize: 7
+            font.bold: true
+            color: Color.composed("bar.text", "bar.text-alpha", Color.bar.text, 0.9)
+        }
     }
 
     MouseArea {
         id: mouseArea
         anchors.fill: parent
         hoverEnabled: true
-        acceptedButtons: Qt.LeftButton | Qt.RightButton
+        acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
         cursorShape: root.isDragging ? Qt.ClosedHandCursor : Qt.PointingHandCursor
 
         drag.target: root
@@ -177,25 +207,46 @@ Item {
             if (mouse.button === Qt.LeftButton) {
                 launchBounce.restart()
                 root.itemLeftClicked(root.itemData)
+                if (root.itemData && root.itemData.isMinimized) return
                 if (root.itemData && root.itemData.isRunning) {
-                    var tops = root.itemData.toplevels || []
-                    if (tops.length > 0) {
-                        if (root.itemData.isActive && tops.length > 1) {
-                            if (tops[1].activate) tops[1].activate()
-                        } else {
-                            if (tops[0].activate) tops[0].activate()
+                    var windows = root.itemData.windows || []
+                    var target = null
+                    if (windows.length > 0) {
+                        target = (root.itemData.isActive && windows.length > 1)
+                            ? DockModel.nextWindowAfterActive(windows, null)
+                            : windows[0]
+                    } else {
+                        var tops = root.itemData.toplevels || []
+                        if (tops.length > 0) {
+                            target = { toplevel: tops[0] }
                         }
+                    }
+                    if (target && target.toplevel && target.toplevel.activate) {
+                        target.toplevel.activate()
                     }
                 } else if (root.itemData) {
                     if (root.shell && root.shell.appLibrary && typeof root.shell.appLibrary.launch === "function") {
                         root.shell.appLibrary.launch(root.itemData.appId, root.itemData.name)
                     } else {
-                        var target = root.itemData.appId ? (root.itemData.appId + ".desktop") : (root.itemData.exec + ".desktop")
-                        Util.execDetached("uwsm-app -- gtk-launch " + Util.shellQuote(target) + " || uwsm-app -- " + root.itemData.exec)
+                        var target2 = root.itemData.appId ? (root.itemData.appId + ".desktop") : (root.itemData.exec + ".desktop")
+                        Util.execDetached("uwsm-app -- gtk-launch " + Util.shellQuote(target2) + " || uwsm-app -- " + root.itemData.exec)
                     }
                 }
+            } else if (mouse.button === Qt.MiddleButton) {
+                launchBounce.restart()
+                root.newWindowRequested(root.itemData)
             } else if (mouse.button === Qt.RightButton) {
                 root.itemRightClicked(root.itemData, root)
+            }
+        }
+
+        onWheel: function(wheel) {
+            if (root.isDragging || !root.itemData || !root.itemData.isRunning || root.itemData.isMinimized) return
+            var windows = root.itemData.windows || []
+            if (windows.length < 2) return
+            var target = DockModel.cycleWindow(windows, null, wheel.angleDelta.y > 0 ? 1 : -1)
+            if (target && target.toplevel && target.toplevel.activate) {
+                target.toplevel.activate()
             }
         }
     }
