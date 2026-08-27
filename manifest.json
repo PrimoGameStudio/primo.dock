@@ -1,11 +1,11 @@
-﻿{
+{
   "schemaVersion": 1,
   "id": "primo.dock",
   "name": "PrimoDock",
   "version": "1.0.0",
-  "author": "PrimoGameStudio",
+  "author": "primo",
   "license": "MIT",
-  "description": "Native animated application dock for Omarchy Quattro with dynamic positioning, Hyprland window tracking, Drag & Drop, and seamless Omarchy theme integration.",
+  "description": "Application dock for Omarchy. Tracks Hyprland windows across workspaces with smart launch, focus and cycling behavior, per-window minimize-to-dock and restore, drag & drop reordering, and a rich right-click action card featuring .desktop quick actions. Touch-friendly long-press gestures mirror every mouse interaction, a Super-held System menu handles pinning and custom icon overrides, and Chromium webapps launch reliably alongside seamless Omarchy theme integration.",
   "kinds": [
     "panel"
   ],

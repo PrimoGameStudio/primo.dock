@@ -25,12 +25,15 @@ Item {
     property int systemBorderSize: 2
     property int systemRounding: 12
     property bool isSelected: false
+    property int longPressDuration: 600
     readonly property bool containsMouse: mouseArea.containsMouse
 
     signal moveRequested(int fromIdx, int toIdx)
-    signal itemRightClicked(var item, var targetItem)
+    signal itemRightClicked(var item, var targetItem, bool withSuper)
     signal itemLeftClicked(var item)
-    signal newWindowRequested(var item)
+    signal itemFloatToggleRequested(var item)
+    signal itemLaunchRequested(var item, bool superHeld)
+    signal newWindowRequested(var item, bool superHeld)
 
     implicitWidth: root.dockItemSize - 4
     implicitHeight: root.dockItemSize - 4
@@ -172,16 +175,40 @@ Item {
         drag.threshold: 6
 
         property bool didDrag: false
+        property bool suppressClick: false
+        property bool pressSuperHeld: false
+        property bool pressShiftHeld: false
+
+        // Long-press opens the same context menu as right-click (touch-friendly)
+        Timer {
+            id: longPressTimer
+            interval: root.longPressDuration
+            repeat: false
+            onTriggered: {
+                mouseArea.suppressClick = true
+                root.itemRightClicked(root.itemData, root, mouseArea.pressSuperHeld)
+            }
+        }
 
         onPressed: function(mouse) {
+            // Reset interaction state on every press so stale flags can't swallow later clicks
+            didDrag = false
+            suppressClick = false
+            // Snapshot modifiers at press time (release-time state can miss early key release)
+            pressSuperHeld = (mouse.modifiers & Qt.MetaModifier) !== 0
+            pressShiftHeld = (mouse.modifiers & Qt.ShiftModifier) !== 0
             if (mouse.button === Qt.LeftButton) {
-                didDrag = false
+                longPressTimer.restart()
+            } else {
+                longPressTimer.stop()
             }
         }
 
         onPositionChanged: function(mouse) {
             if (mouseArea.drag.active) {
-                if (!root.isDragging) {
+                // Finger moved into a reorder drag — cancel the pending long press
+                longPressTimer.stop()
+                if (!root.isDragging && !suppressClick) {
                     root.isDragging = true
                     didDrag = true
                 }
@@ -189,6 +216,7 @@ Item {
         }
 
         onReleased: function(mouse) {
+            if (mouse.button === Qt.LeftButton) longPressTimer.stop()
             if (root.isDragging) {
                 root.isDragging = false
                 var currentCoord = root.isVertical ? root.y : root.x
@@ -199,13 +227,30 @@ Item {
                     root.x = root.isVertical ? 0 : (root.itemIndex * root.dockItemSize)
                     root.y = root.isVertical ? (root.itemIndex * root.dockItemSize) : 0
                 }
+            } else if (suppressClick) {
+                // Long press already opened the menu; snap back any drift
+                root.x = root.isVertical ? 0 : (root.itemIndex * root.dockItemSize)
+                root.y = root.isVertical ? (root.itemIndex * root.dockItemSize) : 0
             }
         }
 
         onClicked: function(mouse) {
-            if (didDrag) return
+            if (didDrag || suppressClick) return
+            // Shift+Left mirrors Middle-click ("Open New Window"); both bypass
+            // restore/activate semantics exactly like the middle button does
+            if (mouse.button === Qt.MiddleButton || (mouse.button === Qt.LeftButton && pressShiftHeld)) {
+                launchBounce.restart()
+                root.newWindowRequested(root.itemData, pressSuperHeld)
+                return
+            }
             if (mouse.button === Qt.LeftButton) {
                 launchBounce.restart()
+                // Super+click on a running app toggles float/tile of its
+                // focus-target window instead of focusing/cycling
+                if (pressSuperHeld && root.itemData && root.itemData.isRunning) {
+                    root.itemFloatToggleRequested(root.itemData)
+                    return
+                }
                 root.itemLeftClicked(root.itemData)
                 if (root.itemData && root.itemData.isMinimized) return
                 if (root.itemData && root.itemData.isRunning) {
@@ -225,18 +270,11 @@ Item {
                         target.toplevel.activate()
                     }
                 } else if (root.itemData) {
-                    if (root.shell && root.shell.appLibrary && typeof root.shell.appLibrary.launch === "function") {
-                        root.shell.appLibrary.launch(root.itemData.appId, root.itemData.name)
-                    } else {
-                        var target2 = root.itemData.appId ? (root.itemData.appId + ".desktop") : (root.itemData.exec + ".desktop")
-                        Util.execDetached("uwsm-app -- gtk-launch " + Util.shellQuote(target2) + " || uwsm-app -- " + root.itemData.exec)
-                    }
+                    // Launching is centralized in the panel (webapp-class fallback etc.)
+                    root.itemLaunchRequested(root.itemData, pressSuperHeld)
                 }
-            } else if (mouse.button === Qt.MiddleButton) {
-                launchBounce.restart()
-                root.newWindowRequested(root.itemData)
             } else if (mouse.button === Qt.RightButton) {
-                root.itemRightClicked(root.itemData, root)
+                root.itemRightClicked(root.itemData, root, pressSuperHeld)
             }
         }
 

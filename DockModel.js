@@ -23,9 +23,13 @@ var DEFAULT_SETTINGS = {
     showRunningDots: true,
     showTooltips: true,
     showTooltipsDelay: 350,
+    longPressDuration: 600,
     toggleWithBar: true,
     showVisualizer: true,
-    visualizerBars: 32
+    visualizerBars: 32,
+    monitor: "",
+    floatingWindowScaleX: 0.75,
+    floatingWindowScaleY: 0.75
 };
 
 var SETTINGS_CLAMPS = {
@@ -36,7 +40,10 @@ var SETTINGS_CLAMPS = {
     dragScale: { min: 1.0, max: 2.5 },
     backgroundOpacity: { min: 0.0, max: 1.0 },
     showTooltipsDelay: { min: 0, max: 5000 },
-    visualizerBars: { min: 4, max: 64 }
+    longPressDuration: { min: 300, max: 2000 },
+    visualizerBars: { min: 4, max: 64 },
+    floatingWindowScaleX: { min: 0.1, max: 1.0 },
+    floatingWindowScaleY: { min: 0.1, max: 1.0 }
 };
 
 function clampNumber(value, min, max, fallback) {
@@ -62,6 +69,11 @@ function parseSettings(raw) {
     var out = {};
     for (var key in DEFAULT_SETTINGS) {
         var val = parsed[key];
+        if (key === "monitor" && (val === undefined || val === null || val === "")) {
+            if (parsed["display"] !== undefined && parsed["display"] !== null) {
+                val = parsed["display"];
+            }
+        }
         var def = DEFAULT_SETTINGS[key];
         var clamp = SETTINGS_CLAMPS[key];
         if (typeof def === "boolean") {
@@ -252,6 +264,50 @@ function isPinned(pinnedIds, appId) {
     return arr.indexOf(stripDesktop(appId)) >= 0;
 }
 
+// Chromium --app windows expose ids/classes like "chrome-<host>__<path>-<profile>"
+// (e.g. "chrome-www.facebook.com__-Default"). Their .desktop entries frequently
+// don't exist, but the URL is fully recoverable from the id itself.
+var WEBAPP_CLASS_RE = /^chrome-(.+)-([A-Za-z0-9]+)$/;
+
+function isWebappClassId(appId) {
+    var m = WEBAPP_CLASS_RE.exec(String(appId || ""));
+    if (!m) return false;
+    var body = m[1];
+    var sep = body.indexOf("__");
+    var host = sep >= 0 ? body.slice(0, sep) : body;
+    return host.length > 0 && host.indexOf(".") > 0;
+}
+
+// Apps that accept a flag to force an additional window when relaunched.
+// Single-instance apps without such a flag will still hand off / focus.
+var NEW_INSTANCE_FLAGS = {
+    "librewolf": "--new-window",
+    "firefox": "--new-window",
+    "firefox-esr": "--new-window",
+    "chromium": "--new-window",
+    "google-chrome": "--new-window",
+    "brave-browser": "--new-window",
+    "vivaldi-stable": "--new-window",
+    "microsoft-edge": "--new-window"
+};
+
+function newInstanceFlag(appId) {
+    return NEW_INSTANCE_FLAGS[String(appId || "").toLowerCase()] || "";
+}
+
+function webappUrlFromId(appId) {
+    var m = WEBAPP_CLASS_RE.exec(String(appId || ""));
+    if (!m) return "";
+    var body = m[1];
+    var sep = body.indexOf("__");
+    var host = sep >= 0 ? body.slice(0, sep) : body;
+    var path = sep >= 0 ? body.slice(sep + 2) : "";
+    if (!host || host.indexOf(".") < 0) return "";
+    var url = "https://" + host;
+    if (path) url += "/" + path.replace(/_/g, "/");
+    return url;
+}
+
 function reorderPinned(pinnedIds, dockItems, fromIndex, toIndex) {
     if (fromIndex === toIndex || fromIndex < 0 || toIndex < 0) return pinnedIds;
     if (!dockItems || fromIndex >= dockItems.length || toIndex >= dockItems.length) return pinnedIds;
@@ -303,7 +359,7 @@ function entryFor(appRows, appId) {
 
 // Attach per-window metadata (workspace, monitor, focus priority) to a toplevel.
 // Workspace/monitor come from the Quickshell HyprlandToplevel attached property.
-function toplevelMeta(toplevel, focusedWorkspaceId, focusedMonitorName) {
+function toplevelMeta(toplevel, focusedWorkspaceId, focusedMonitorName, pre) {
     var meta = {
         toplevel: toplevel,
         title: (toplevel && toplevel.title) ? toplevel.title : "",
@@ -316,19 +372,28 @@ function toplevelMeta(toplevel, focusedWorkspaceId, focusedMonitorName) {
         onFocusedMonitor: false,
         minimized: !!(toplevel && toplevel.minimized)
     };
-    try {
-        var ht = toplevel ? toplevel.HyprlandToplevel : null;
-        if (ht) {
-            if (ht.address) meta.address = "0x" + String(ht.address);
-            var ws = ht.workspace;
-            if (ws) {
-                if (ws.id !== undefined) meta.workspaceId = ws.id;
-                if (ws.name) meta.workspaceName = String(ws.name);
+    // Preferred path: precomputed QML-side info (attached properties are not
+    // readable from this library file). Legacy lookup kept as fallback.
+    if (pre) {
+        meta.address = String(pre.address || "");
+        meta.workspaceId = (pre.workspaceId !== undefined) ? pre.workspaceId : -1;
+        meta.workspaceName = String(pre.workspaceName || "");
+        meta.monitorName = String(pre.monitorName || "");
+    } else {
+        try {
+            var ht = toplevel ? toplevel.HyprlandToplevel : null;
+            if (ht) {
+                if (ht.address) meta.address = "0x" + String(ht.address);
+                var ws = ht.workspace;
+                if (ws) {
+                    if (ws.id !== undefined) meta.workspaceId = ws.id;
+                    if (ws.name) meta.workspaceName = String(ws.name);
+                }
+                var mon = ht.monitor;
+                if (mon && mon.name) meta.monitorName = String(mon.name);
             }
-            var mon = ht.monitor;
-            if (mon && mon.name) meta.monitorName = String(mon.name);
-        }
-    } catch (e) {}
+        } catch (e) {}
+    }
     if (focusedWorkspaceId !== undefined && meta.workspaceId === focusedWorkspaceId) {
         meta.onFocusedWorkspace = true;
     }
@@ -391,7 +456,7 @@ function cycleWindow(windows, activeToplevel, direction) {
     return arr[next];
 }
 
-function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appRows, appLibrary, minimizedIds, focusedWorkspaceId, focusedMonitorName) {
+function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appRows, appLibrary, minimizedIds, focusedWorkspaceId, focusedMonitorName, minimizedAddrSet, minimizedClassTitleSet, toplevelInfos) {
     var pinned = Array.isArray(pinnedIds) ? pinnedIds : [];
     var list = toArray(toplevels);
 
@@ -431,11 +496,33 @@ function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appR
     }
 
     // Build per-window metadata (sorted by focus priority) for each running app.
+    var infoMap = new Map();
+    if (toplevelInfos) {
+        for (var ti = 0; ti < toplevelInfos.length; ti++) {
+            var inf = toplevelInfos[ti];
+            if (inf && inf.toplevel) infoMap.set(inf.toplevel, inf);
+        }
+    }
     for (var rk in runningMap) {
         var rinfo = runningMap[rk];
         var metas = [];
         for (var w = 0; w < rinfo.raw.length; w++) {
-            metas.push(toplevelMeta(rinfo.raw[w], focusedWorkspaceId, focusedMonitorName));
+            var wm = toplevelMeta(rinfo.raw[w], focusedWorkspaceId, focusedMonitorName, infoMap.get(rinfo.raw[w]));
+            // Per-window "parked on special:minimized" state. EXCLUSIVE sources:
+            // address-carrying metas trust only the exact address match — the
+            // class+title heuristic applies solely to address-less snapshots,
+            // otherwise duplicate titles flip every sibling row's state.
+            wm.isDocked = false;
+            if (wm.address) {
+                if (minimizedAddrSet) {
+                    var bare = String(wm.address).toLowerCase().replace(/^0x/, "");
+                    wm.isDocked = minimizedAddrSet[bare] === true;
+                }
+            } else if (minimizedClassTitleSet) {
+                var ctKey = String(wm.toplevel ? wm.toplevel.appId : "") + "\u001f" + String(wm.title || "");
+                wm.isDocked = minimizedClassTitleSet[ctKey] === true;
+            }
+            metas.push(wm);
         }
         rinfo.toplevels = rinfo.raw;
         rinfo.windows = sortWindows(metas);
