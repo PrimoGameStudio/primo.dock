@@ -118,18 +118,13 @@ Item {
         }
     }
 
-    FileView {
-        id: shellConfigFile
-        path: root.shellConfigPath
-        watchChanges: true
-        printErrors: false
-        onLoaded: {
-            root.updatePluginEnabled()
+    Timer {
+        id: shellPollTimer
+        interval: 3000
+        repeat: true
+        running: true
+        onTriggered: {
             if (!shellSafeRead.running) shellSafeRead.running = true
-        }
-        onFileChanged: {
-            if (!shellSafeRead.running) shellSafeRead.running = true
-            else shellConfigDebounce.restart()
         }
     }
 
@@ -483,14 +478,8 @@ Item {
     }
 
     function refresh() {
-        // Prefer descriptor-validated helper; fallback to guarded FileView text for immediacy
         if (!settingsSafeRead.running) settingsSafeRead.running = true
-        var docText = userSettingsFile.text() || ""
-        if (!root.isSafeText(docText, root.maxDockSettingsSize)) docText = ""
-        root.dockSettings = DockModel.parseSettings(docText)
-        root.pinnedIds = DockModel.parsePinned(docText)
-        root.blacklistIds = DockModel.parseBlacklist(docText)
-        IconResolver.loadCustomIcons(root.extractCustomIcons(docText))
+        if (!shellSafeRead.running) shellSafeRead.running = true
         root.refreshLayers()
         root.updatePluginEnabled()
         root.updateDockItems()
@@ -580,14 +569,6 @@ Item {
         running: true
         command: ["bash", "-c", "[[ -f $HOME/.local/state/omarchy/toggles/bar-off ]] && echo yes || echo no"]
         stdout: SplitParser { onRead: function(line) { root.barHidden = String(line).trim() === "yes" } }
-    }
-    // Watch toggles directory (FileView cannot observe a non-existent file creation/deletion)
-    FileView {
-        id: barOffWatcher
-        path: Quickshell.env("HOME") + "/.local/state/omarchy/toggles"
-        watchChanges: true
-        printErrors: false
-        onFileChanged: barHiddenProbe.running = true
     }
 
     Timer {
@@ -809,7 +790,7 @@ Item {
     }
 
     // Pinned apps live inside primo.dock-settings.json under "pinned"
-    // (single FileView: userSettingsFile — watch + write, data reads via bounded no-follow helper)
+    // (data reads via bounded no-follow helper safeRead.py, writes via atomic settingsWriter)
     Process {
         id: settingsSafeRead
         command: ["python3", root.safeReadHelper, root.settingsPath, String(root.maxDockSettingsSize)]
@@ -827,35 +808,38 @@ Item {
         }
     }
 
-    Timer {
-        id: userSettingsDebounce
-        interval: 150
-        repeat: false
-        onTriggered: {
-            if (!settingsSafeRead.running) settingsSafeRead.running = true
+    Process {
+        id: settingsWriter
+        command: ["python3", "-c",
+                  "import os, tempfile, sys, base64\n" +
+                  "path = sys.argv[1]\n" +
+                  "data = base64.b64decode(sys.argv[2])\n" +
+                  "parent = os.path.dirname(path)\n" +
+                  "os.makedirs(parent, exist_ok=True)\n" +
+                  "fd, tmp = tempfile.mkstemp(dir=parent, prefix='.settings-')\n" +
+                  "try:\n" +
+                  "    with os.fdopen(fd, 'wb') as f:\n" +
+                  "        f.write(data)\n" +
+                  "    os.replace(tmp, path)\n" +
+                  "except Exception as e:\n" +
+                  "    try: os.unlink(tmp)\n" +
+                  "    except: pass\n" +
+                  "    sys.exit(1)\n",
+                  root.settingsPath, ""]
+        onExited: function(code, status) {
+            if (code === 0) {
+                if (!settingsSafeRead.running) settingsSafeRead.running = true
+            }
         }
     }
 
-    FileView {
-        id: userSettingsFile
-        path: root.settingsPath
-        watchChanges: true
-        atomicWrites: true
-        printErrors: false
-        onLoaded: {
+    Timer {
+        id: settingsPollTimer
+        interval: 3000
+        repeat: true
+        running: true
+        onTriggered: {
             if (!settingsSafeRead.running) settingsSafeRead.running = true
-        }
-        onLoadFailed: {
-            root.dockSettings = DockModel.parseSettings("")
-            root.pinnedIds = DockModel.DEFAULT_PINNED.slice()
-            root.blacklistIds = DockModel.DEFAULT_BLACKLIST.slice()
-            IconResolver.loadCustomIcons({})
-            root.saveDockState()
-            root.updateDockItems()
-        }
-        onFileChanged: {
-            if (!settingsSafeRead.running) settingsSafeRead.running = true
-            else userSettingsDebounce.restart()
         }
     }
 
@@ -870,7 +854,24 @@ Item {
         doc.pinned = JSON.parse(DockModel.serializePinned(root.pinnedIds)).pinned
         doc.blacklist = JSON.parse(DockModel.serializeBlacklist(root.blacklistIds)).blacklist
         doc.customIcons = IconResolver.allCustomIcons()
-        userSettingsFile.setText(JSON.stringify(doc, null, 2) + "\n")
+        var jsonStr = JSON.stringify(doc, null, 2) + "\n"
+        settingsWriter.command = ["python3", "-c",
+                  "import os, tempfile, sys, base64\n" +
+                  "path = sys.argv[1]\n" +
+                  "data = base64.b64decode(sys.argv[2])\n" +
+                  "parent = os.path.dirname(path)\n" +
+                  "os.makedirs(parent, exist_ok=True)\n" +
+                  "fd, tmp = tempfile.mkstemp(dir=parent, prefix='.settings-')\n" +
+                  "try:\n" +
+                  "    with os.fdopen(fd, 'wb') as f:\n" +
+                  "        f.write(data)\n" +
+                  "    os.replace(tmp, path)\n" +
+                  "except Exception as e:\n" +
+                  "    try: os.unlink(tmp)\n" +
+                  "    except: pass\n" +
+                  "    sys.exit(1)\n",
+                  root.settingsPath, btoa(jsonStr)]
+        settingsWriter.running = true
     }
 
     // Extract the flat appId→icon map from a merged state document
@@ -1102,12 +1103,10 @@ Item {
     readonly property real systemMenuHeight: 32 * 2 + 2 + 4
 
     Component.onCompleted: {
-        var docText = userSettingsFile.text() || ""
-        if (!root.isSafeText(docText, root.maxDockSettingsSize)) docText = ""
-        root.dockSettings = DockModel.parseSettings(docText)
-        root.pinnedIds = DockModel.parsePinned(docText)
-        root.blacklistIds = DockModel.parseBlacklist(docText)
-        IconResolver.loadCustomIcons(root.extractCustomIcons(docText))
+        root.dockSettings = DockModel.parseSettings("")
+        root.pinnedIds = DockModel.DEFAULT_PINNED.slice()
+        root.blacklistIds = DockModel.DEFAULT_BLACKLIST.slice()
+        IconResolver.loadCustomIcons({})
         refreshLayers()
         updatePluginEnabled()
         refreshMinimized()
