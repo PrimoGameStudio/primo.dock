@@ -18,6 +18,31 @@ Item {
     property var manifest: null
     property var pluginRegistry: null
 
+    // File type and size bounds for descriptor-validated reads (guard against DoS / binary injection)
+    readonly property int maxShellJsonSize: 65536
+    readonly property int maxDockSettingsSize: 65536
+    readonly property int maxBarOffSize: 1024
+    function isSafeText(t, max) {
+        if (t == null) return false
+        var s = String(t)
+        if (s.length > max) return false
+        if (s.indexOf("\u0000") !== -1) return false
+        return true
+    }
+    // Strict integer 4..64 validation for cava bars — data, not shell source (Option 1)
+    function validatedVisualizerBars() {
+        var raw = dockSettings ? dockSettings.visualizerBars : 32
+        var n = Math.floor(Number(raw))
+        if (!isFinite(n)) return 32
+        if (n < 4) return 4
+        if (n > 64) return 64
+        return n
+    }
+    readonly property int safeVisualizerBars: validatedVisualizerBars()
+    readonly property string pluginDir: Quickshell.env("HOME") + "/.config/omarchy/plugins/primo.dock"
+    readonly property string safeReadHelper: pluginDir + "/helpers/safeRead.py"
+    readonly property string cavaHelper: pluginDir + "/helpers/cava-gen.py"
+
     // Dock state & Multi-source Live Bar Position Tracking
     property bool opened: true
     property bool pluginEnabled: true
@@ -63,6 +88,36 @@ Item {
         root.pluginEnabled = true
     }
 
+    // Bounded no-follow descriptor-validated read for shell.json (data path, not FileView text source)
+    Process {
+        id: shellSafeRead
+        command: ["python3", root.safeReadHelper, root.shellConfigPath, String(root.maxShellJsonSize)]
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                var doc = text
+                if (!root.isSafeText(doc, root.maxShellJsonSize)) return
+                root.updatePluginEnabled()
+                try {
+                    var cfg = JSON.parse(doc)
+                    if (cfg && cfg.bar && cfg.bar.position) {
+                        root.detectedBarPosition = cfg.bar.position
+                    }
+                } catch(e) {}
+                root.refreshLayers()
+            }
+        }
+    }
+
+    Timer {
+        id: shellConfigDebounce
+        interval: 150
+        repeat: false
+        onTriggered: {
+            if (!shellSafeRead.running) shellSafeRead.running = true
+        }
+    }
+
     FileView {
         id: shellConfigFile
         path: root.shellConfigPath
@@ -70,23 +125,11 @@ Item {
         printErrors: false
         onLoaded: {
             root.updatePluginEnabled()
-            try {
-                var cfg = JSON.parse(text())
-                if (cfg && cfg.bar && cfg.bar.position) {
-                    root.detectedBarPosition = cfg.bar.position
-                }
-            } catch(e) {}
+            if (!shellSafeRead.running) shellSafeRead.running = true
         }
         onFileChanged: {
-            reload()
-            root.updatePluginEnabled()
-            try {
-                var cfg = JSON.parse(text())
-                if (cfg && cfg.bar && cfg.bar.position) {
-                    root.detectedBarPosition = cfg.bar.position
-                }
-            } catch(e) {}
-            root.refreshLayers()
+            if (!shellSafeRead.running) shellSafeRead.running = true
+            else shellConfigDebounce.restart()
         }
     }
 
@@ -440,7 +483,10 @@ Item {
     }
 
     function refresh() {
+        // Prefer descriptor-validated helper; fallback to guarded FileView text for immediacy
+        if (!settingsSafeRead.running) settingsSafeRead.running = true
         var docText = userSettingsFile.text() || ""
+        if (!root.isSafeText(docText, root.maxDockSettingsSize)) docText = ""
         root.dockSettings = DockModel.parseSettings(docText)
         root.pinnedIds = DockModel.parsePinned(docText)
         root.blacklistIds = DockModel.parseBlacklist(docText)
@@ -535,13 +581,12 @@ Item {
         command: ["bash", "-c", "[[ -f $HOME/.local/state/omarchy/toggles/bar-off ]] && echo yes || echo no"]
         stdout: SplitParser { onRead: function(line) { root.barHidden = String(line).trim() === "yes" } }
     }
+    // Watch toggles directory (FileView cannot observe a non-existent file creation/deletion)
     FileView {
-        id: barOffFile
-        path: Quickshell.env("HOME") + "/.local/state/omarchy/toggles/bar-off"
+        id: barOffWatcher
+        path: Quickshell.env("HOME") + "/.local/state/omarchy/toggles"
         watchChanges: true
         printErrors: false
-        onLoaded: barHiddenProbe.running = true
-        onLoadFailed: barHiddenProbe.running = true
         onFileChanged: barHiddenProbe.running = true
     }
 
@@ -589,7 +634,8 @@ Item {
     Process {
         id: cavaProc
         running: root.pluginEnabled && root.dockShowVisualizer
-        command: ["bash", "-c", "config_file=$(mktemp); trap 'rm -f \"$config_file\"' EXIT; echo -e '[general]\\nbars = " + root.dockVisualizerBars + "\\n[output]\\nmethod = raw\\nraw_target = /dev/stdout\\ndata_format = ascii\\nascii_max_range = 100' > \"$config_file\"; exec cava -p \"$config_file\""]
+        // Strict integer validated via safeVisualizerBars (4..64) and passed as argv data to helper — no shell interpolation
+        command: ["python3", root.cavaHelper, String(root.safeVisualizerBars)]
         stdout: SplitParser {
             onRead: function(line) {
                 var text = String(line).trim()
@@ -763,7 +809,32 @@ Item {
     }
 
     // Pinned apps live inside primo.dock-settings.json under "pinned"
-    // (single FileView: userSettingsFile)
+    // (single FileView: userSettingsFile — watch + write, data reads via bounded no-follow helper)
+    Process {
+        id: settingsSafeRead
+        command: ["python3", root.safeReadHelper, root.settingsPath, String(root.maxDockSettingsSize)]
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                var doc = text
+                if (!root.isSafeText(doc, root.maxDockSettingsSize)) return
+                root.dockSettings = DockModel.parseSettings(doc)
+                root.pinnedIds = DockModel.parsePinned(doc)
+                root.blacklistIds = DockModel.parseBlacklist(doc)
+                IconResolver.loadCustomIcons(root.extractCustomIcons(doc))
+                root.updateDockItems()
+            }
+        }
+    }
+
+    Timer {
+        id: userSettingsDebounce
+        interval: 150
+        repeat: false
+        onTriggered: {
+            if (!settingsSafeRead.running) settingsSafeRead.running = true
+        }
+    }
 
     FileView {
         id: userSettingsFile
@@ -772,14 +843,7 @@ Item {
         atomicWrites: true
         printErrors: false
         onLoaded: {
-            var doc = text()
-            root.dockSettings = DockModel.parseSettings(doc)
-            // Pinned apps ride in the same document under "pinned"
-            root.pinnedIds = DockModel.parsePinned(doc)
-            // So do the blacklist and custom icon overrides
-            root.blacklistIds = DockModel.parseBlacklist(doc)
-            IconResolver.loadCustomIcons(root.extractCustomIcons(doc))
-            root.updateDockItems()
+            if (!settingsSafeRead.running) settingsSafeRead.running = true
         }
         onLoadFailed: {
             root.dockSettings = DockModel.parseSettings("")
@@ -789,7 +853,10 @@ Item {
             root.saveDockState()
             root.updateDockItems()
         }
-        onFileChanged: userSettingsFile.reload()
+        onFileChanged: {
+            if (!settingsSafeRead.running) settingsSafeRead.running = true
+            else userSettingsDebounce.restart()
+        }
     }
 
     function saveCustomIcons() {
@@ -1036,6 +1103,7 @@ Item {
 
     Component.onCompleted: {
         var docText = userSettingsFile.text() || ""
+        if (!root.isSafeText(docText, root.maxDockSettingsSize)) docText = ""
         root.dockSettings = DockModel.parseSettings(docText)
         root.pinnedIds = DockModel.parsePinned(docText)
         root.blacklistIds = DockModel.parseBlacklist(docText)
@@ -1044,6 +1112,9 @@ Item {
         updatePluginEnabled()
         refreshMinimized()
         updateDockItems()
+        // Kick descriptor-validated reads for authoritative state (data via argv/stdin, not FileView source)
+        if (!shellSafeRead.running) shellSafeRead.running = true
+        if (!settingsSafeRead.running) settingsSafeRead.running = true
     }
 
     readonly property int itemsCount: Math.max(1, root.dockItems.length)

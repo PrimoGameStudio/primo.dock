@@ -52,8 +52,20 @@ function clampNumber(value, min, max, fallback) {
     return Math.max(min, Math.min(max, n));
 }
 
+var MAX_SETTINGS_SIZE = 65536;
+
+function isSafeRaw(raw, maxSize) {
+    if (raw == null) return true;
+    var s = String(raw);
+    if (s.length > maxSize) return false;
+    if (s.indexOf("\u0000") !== -1) return false;
+    return true;
+}
+
 function parseSettings(raw) {
+    if (!isSafeRaw(raw, MAX_SETTINGS_SIZE)) return parseSettings("");
     var text = String(raw == null ? "" : raw).trim();
+    if (text.length > MAX_SETTINGS_SIZE) return parseSettings("");
     var parsed = null;
     if (text) {
         try {
@@ -115,8 +127,10 @@ function serializeSettings(settings) {
 }
 
 function parseBlacklist(raw) {
+    if (!isSafeRaw(raw, MAX_SETTINGS_SIZE)) return DEFAULT_BLACKLIST.slice();
     var text = String(raw == null ? "" : raw).trim();
     if (!text) return DEFAULT_BLACKLIST.slice();
+    if (text.length > MAX_SETTINGS_SIZE) return DEFAULT_BLACKLIST.slice();
 
     var parsed = null;
     try {
@@ -195,8 +209,10 @@ function toArray(list) {
 }
 
 function parsePinned(raw) {
+    if (!isSafeRaw(raw, MAX_SETTINGS_SIZE)) return DEFAULT_PINNED.slice();
     var text = String(raw == null ? "" : raw).trim();
     if (!text) return DEFAULT_PINNED.slice();
+    if (text.length > MAX_SETTINGS_SIZE) return DEFAULT_PINNED.slice();
 
     var parsed = null;
     try {

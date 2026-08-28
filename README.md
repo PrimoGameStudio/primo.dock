@@ -58,30 +58,6 @@ o.bind("SUPER + SHIFT + ALT + Space", "", { launch = 'bash -c "quickshell -p /us
 
 ---
 
-## 📦 Installation
-
-> Requires [Omarchy Quattro](https://omarchy.org/) (Quickshell + Hyprland).
-
-```bash
-omarchy plugin add https://github.com/PrimoGameStudio/primo.dock.git --enable
-```
-
-This clones the plugin to `~/.config/omarchy/plugins/primo.dock/`, validates `manifest.json`, and enables it via IPC. Omit `--enable` to review code first, then:
-
-```bash
-omarchy plugin enable primo.dock
-omarchy plugin list   # verify
-```
-
-To update:
-
-```bash
-omarchy plugin update primo.dock
-# or update all plugins: omarchy plugin update
-```
-
----
-
 ## 🗑️ Uninstallation
 
 To remove PrimoDock from your Omarchy environment:
