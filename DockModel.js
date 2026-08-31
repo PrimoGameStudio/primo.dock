@@ -237,9 +237,15 @@ function parsePinned(raw) {
         }
     } else if (typeof parsed === "object" && Array.isArray(parsed.pinned)) {
         arr = parsed.pinned;
+        // Explicit {"pinned":[]} means user cleared dock - preserve empty,
+        // only fall back to defaults when key missing/invalid
+        if (arr.length === 0) {
+            return [];
+        }
+    } else {
+        // No pinned key present - use defaults (first run / legacy file)
+        if (arr.length === 0) return DEFAULT_PINNED.slice();
     }
-
-    if (arr.length === 0) return DEFAULT_PINNED.slice();
 
     var out = [];
     var seen = {};

@@ -83,9 +83,10 @@ def main():
             sys.exit(1)
         if b"\x00" in data:
             sys.exit(1)
-        # Validate UTF-8 (FileView text() is UTF-8)
+        # Validate UTF-8 (FileView text() is UTF-8), strip UTF-8 BOM if present
         try:
-            data.decode("utf-8")
+            text = data.decode("utf-8-sig")
+            data = text.encode("utf-8")
         except UnicodeDecodeError:
             sys.exit(1)
         sys.stdout.buffer.write(data)

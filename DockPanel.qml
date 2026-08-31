@@ -477,8 +477,17 @@ Item {
         }
     }
 
+    function requestSettingsRead() {
+        if (settingsWriter.running || root.writePending || settingsSafeRead.running) {
+            root.pendingRead = true
+            return
+        }
+        root.readSeq = root.writeSeq
+        settingsSafeRead.running = true
+    }
+
     function refresh() {
-        if (!settingsSafeRead.running) settingsSafeRead.running = true
+        root.requestSettingsRead()
         if (!shellSafeRead.running) shellSafeRead.running = true
         root.refreshLayers()
         root.updatePluginEnabled()
@@ -555,7 +564,7 @@ Item {
     onMinimizedAddrsChanged: updateDockItems()
     onMinimizedClassTitlesChanged: updateDockItems()
 
-    // All persistent state lives in primo.dock-settings.json (single FileView)
+    // All persistent state lives in primo.dock-settings.json (single file, reads via Process+safeRead.py/StdioCollector, writes via atomic settingsWriter)
     property var pinnedIds: []
     property var blacklistIds: []
     property var dockItems: []
@@ -585,6 +594,14 @@ Item {
     // Basic dock settings + pinned apps persistence (~/.config/omarchy/primo.dock-settings.json)
     property string settingsPath: Quickshell.env("HOME") + "/.config/omarchy/primo.dock-settings.json"
     property var dockSettings: DockModel.DEFAULT_SETTINGS
+
+    // Guard against hot-reload racing a pending save (pin/unpin & reorder)
+    property bool writePending: false
+    property string pendingDockJson: ""
+    property bool pendingRead: false
+    property int writeSeq: 0
+    property int readSeq: 0
+    property string lastWrittenJson: ""
 
     readonly property int dockItemSize: Number(dockSettings.itemSize) || 80
     readonly property int dockIconSize: Number(dockSettings.iconSize) || 38
@@ -797,8 +814,36 @@ Item {
         stdout: StdioCollector {
             waitForEnd: true
             onStreamFinished: {
+                // Stale poll: ignore if a save was queued after this read
+                // started (TOCTOU) or is still in-flight before os.replace.
+                if (root.readSeq < root.writeSeq || settingsWriter.running || root.writePending) return
                 var doc = text
+                // Strip UTF-8 BOM if present (manual edits)
+                if (doc.length > 0 && doc.charCodeAt(0) === 0xFEFF) doc = doc.slice(1)
                 if (!root.isSafeText(doc, root.maxDockSettingsSize)) return
+                // If we have just written and the file hasn't caught up yet
+                // (e.g. poll fired before os.replace visible), discard stale
+                // content that doesn't match our last written version.
+                if (root.lastWrittenJson !== "" && doc.trim() !== root.lastWrittenJson.trim()) {
+                    // Only treat as stale if we are still within the write
+                    // debounce window or file is older than our last write.
+                    // If file genuinely differs (external edit) we will pick it
+                    // up on next poll after debounce.
+                    if (settingsWriter.running || root.writePending || root.readSeq < root.writeSeq) return
+                    // Poll after ~3s with old content: check if our last write
+                    // pinned list is not reflected in file -> stale
+                    try {
+                        var filePinned = DockModel.parsePinned(doc)
+                        var memPinned = root.pinnedIds
+                        if (JSON.stringify(filePinned) !== JSON.stringify(memPinned)) {
+                            // File lags behind our in-memory state -> ignore
+                            // and re-queue a fresh read after debounce.
+                            root.pendingRead = true
+                            verifyDebounce.restart()
+                            return
+                        }
+                    } catch(e) {}
+                }
                 root.dockSettings = DockModel.parseSettings(doc)
                 root.pinnedIds = DockModel.parsePinned(doc)
                 root.blacklistIds = DockModel.parseBlacklist(doc)
@@ -827,9 +872,56 @@ Item {
                   "    sys.exit(1)\n",
                   root.settingsPath, ""]
         onExited: function(code, status) {
-            if (code === 0) {
-                if (!settingsSafeRead.running) settingsSafeRead.running = true
+            // Drain coalesced saves before re-reading: prevents lost updates
+            // when pin/unpin or reorder are fired faster than the writer.
+            if (root.writePending) {
+                var nextJson = root.pendingDockJson
+                root.pendingDockJson = ""
+                root.writePending = false
+                settingsWriter.command = ["python3", "-c",
+                          "import os, tempfile, sys, base64\n" +
+                          "path = sys.argv[1]\n" +
+                          "data = base64.b64decode(sys.argv[2])\n" +
+                          "parent = os.path.dirname(path)\n" +
+                          "os.makedirs(parent, exist_ok=True)\n" +
+                          "fd, tmp = tempfile.mkstemp(dir=parent, prefix='.settings-')\n" +
+                          "try:\n" +
+                          "    with os.fdopen(fd, 'wb') as f:\n" +
+                          "        f.write(data)\n" +
+                          "    os.replace(tmp, path)\n" +
+                          "except Exception as e:\n" +
+                          "    try: os.unlink(tmp)\n" +
+                          "    except: pass\n" +
+                          "    sys.exit(1)\n",
+                          root.settingsPath, btoa(nextJson)]
+                settingsWriter.running = true
+                return
             }
+            if (code === 0) {
+                // Defer verification read so a pin/reorder that races the
+                // writer's exit doesn't get reverted by stale content.
+                verifyDebounce.restart()
+                if (root.pendingRead) {
+                    // pendingRead will be drained by the debounce timer
+                }
+            } else {
+                // On failure, still drain a pending read if queued
+                if (root.pendingRead) verifyDebounce.restart()
+            }
+        }
+    }
+
+    Timer {
+        id: verifyDebounce
+        interval: 180
+        repeat: false
+        onTriggered: {
+            if (settingsWriter.running || root.writePending) {
+                // Writer became busy again, wait for next exit
+                return
+            }
+            if (root.pendingRead) root.pendingRead = false
+            root.requestSettingsRead()
         }
     }
 
@@ -839,7 +931,7 @@ Item {
         repeat: true
         running: true
         onTriggered: {
-            if (!settingsSafeRead.running) settingsSafeRead.running = true
+            root.requestSettingsRead()
         }
     }
 
@@ -855,6 +947,16 @@ Item {
         doc.blacklist = JSON.parse(DockModel.serializeBlacklist(root.blacklistIds)).blacklist
         doc.customIcons = IconResolver.allCustomIcons()
         var jsonStr = JSON.stringify(doc, null, 2) + "\n"
+        root.lastWrittenJson = jsonStr
+        root.writeSeq++
+        // Coalesce if writer is busy: pin/unpin + reorder spam would
+        // otherwise be dropped because Process.running ignores re-trigger
+        // and a polling read would race the on-disk replace.
+        if (settingsWriter.running || root.writePending) {
+            root.pendingDockJson = jsonStr
+            root.writePending = true
+            return
+        }
         settingsWriter.command = ["python3", "-c",
                   "import os, tempfile, sys, base64\n" +
                   "path = sys.argv[1]\n" +
@@ -1113,7 +1215,7 @@ Item {
         updateDockItems()
         // Kick descriptor-validated reads for authoritative state (data via argv/stdin, not FileView source)
         if (!shellSafeRead.running) shellSafeRead.running = true
-        if (!settingsSafeRead.running) settingsSafeRead.running = true
+        root.requestSettingsRead()
     }
 
     readonly property int itemsCount: Math.max(1, root.dockItems.length)
