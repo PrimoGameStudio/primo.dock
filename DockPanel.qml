@@ -605,6 +605,7 @@ Item {
 
     readonly property int dockItemSize: Number(dockSettings.itemSize) || 80
     readonly property int dockIconSize: Number(dockSettings.iconSize) || 38
+    readonly property int dockThickness: Number(dockSettings.thickness) || dockItemSize
     readonly property int dockPadding: Number(dockSettings.padding) || 48
     readonly property real dockHoverScale: Number(dockSettings.hoverScale) || 2
     readonly property real dockDragScale: Number(dockSettings.dragScale) || 2
@@ -670,9 +671,9 @@ Item {
     }
 
     // Derived dock card geometry (itemSize slots + padding, 2px antialiasing buffer)
-    readonly property real dockWindowThickness: dockItemSize + 2
-    readonly property real dockSurfaceThickness: dockItemSize - 2
-    readonly property real dockContentThickness: dockItemSize - 4
+    readonly property real dockWindowThickness: dockThickness + 2
+    readonly property real dockSurfaceThickness: dockThickness - 2
+    readonly property real dockContentThickness: dockThickness - 4
     readonly property real dockWindowLength: root.itemsCount * dockItemSize + dockPadding + 4
     readonly property real dockSurfaceLength: root.itemsCount * dockItemSize + dockPadding
     readonly property real dockContentLength: root.itemsCount * dockItemSize + dockPadding - 10

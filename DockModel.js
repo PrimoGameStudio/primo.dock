@@ -16,6 +16,7 @@ var DEFAULT_BLACKLIST = [];
 var DEFAULT_SETTINGS = {
     iconSize: 38,
     itemSize: 80,
+    thickness: 58,
     padding: 48,
     hoverScale: 2,
     dragScale: 2,
@@ -35,6 +36,7 @@ var DEFAULT_SETTINGS = {
 var SETTINGS_CLAMPS = {
     iconSize: { min: 12, max: 128 },
     itemSize: { min: 24, max: 160 },
+    thickness: { min: 32, max: 160 },
     padding: { min: 0, max: 48 },
     hoverScale: { min: 1.0, max: 2.0 },
     dragScale: { min: 1.0, max: 2.5 },
@@ -555,7 +557,15 @@ function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appR
         var entry = entryFor(appRows, base.appId);
         if (entry && appLibrary) {
             base.name = appLibrary.entryName(entry) || base.appId;
-            base.icon = appLibrary.iconSource(entry.icon) || base.appId;
+            // iconSource() can return application-x-executable while Omarchy's
+            // asynchronous icon index is still populating.  Do not persist that
+            // generic fallback as this item's preferred icon: doing so makes a
+            // dock entry stay a gear even after the index learns its real
+            // desktop-entry icon.  Retaining the raw icon name lets DockItem
+            // resolve it again on the next binding evaluation.
+            var iconName = String(entry.icon || base.appId);
+            var iconSource = appLibrary.iconSource(iconName) || "";
+            base.icon = iconSource.indexOf("application-x-executable") === -1 ? iconSource : iconName;
         } else {
             base.name = base.appId;
             base.icon = base.appId;
