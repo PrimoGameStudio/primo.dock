@@ -1393,6 +1393,7 @@ Item {
                         shell: root.shell
                         iconBaseSize: root.dockIconSize
                         dockItemSize: root.dockItemSize
+                        dockThickness: root.dockThickness
                         hoverScale: root.dockHoverScale
                         dragScale: root.dockDragScale
                         showRunningDots: root.dockShowRunningDots
