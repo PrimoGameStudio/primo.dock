@@ -18,6 +18,10 @@ Item {
     readonly property bool isVertical: barPosition === "left" || barPosition === "right"
     property int iconBaseSize: 28
     property int dockItemSize: 46
+    // The slot's main axis follows itemSize; its cross axis must follow the
+    // dock thickness.  Keeping both dimensions at itemSize works only when
+    // the dock is square, and otherwise pushes the icon row out of the card.
+    property int dockThickness: dockItemSize
     property real hoverScale: 1.12
     property real dragScale: 1.22
     property bool showRunningDots: true
@@ -35,10 +39,10 @@ Item {
     signal itemLaunchRequested(var item, bool superHeld)
     signal newWindowRequested(var item, bool superHeld)
 
-    implicitWidth: root.dockItemSize - 4
-    implicitHeight: root.dockItemSize - 4
-    width: root.dockItemSize - 4
-    height: root.dockItemSize - 4
+    implicitWidth: (root.isVertical ? root.dockThickness : root.dockItemSize) - 4
+    implicitHeight: (root.isVertical ? root.dockItemSize : root.dockThickness) - 4
+    width: (root.isVertical ? root.dockThickness : root.dockItemSize) - 4
+    height: (root.isVertical ? root.dockItemSize : root.dockThickness) - 4
     z: isDragging ? 100 : (isSelected ? 60 : (mouseArea.containsMouse ? 50 : 1))
 
     // Main animated icon wrapper (strictly centered)
