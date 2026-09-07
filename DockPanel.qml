@@ -670,10 +670,16 @@ Item {
         }
     }
 
+    // The configured thickness is a minimum.  The dock must also contain the
+    // largest hover-scaled icon, its running indicator, and a small breathing
+    // margin; otherwise a compact setting clips enlarged icons below the card.
+    readonly property real dockMinimumThickness: Math.ceil(dockIconSize * dockHoverScale + (dockShowRunningDots ? 7 : 0) + 8)
+    readonly property real dockEffectiveThickness: Math.max(dockThickness, dockMinimumThickness)
+
     // Derived dock card geometry (itemSize slots + padding, 2px antialiasing buffer)
-    readonly property real dockWindowThickness: dockThickness + 2
-    readonly property real dockSurfaceThickness: dockThickness - 2
-    readonly property real dockContentThickness: dockThickness - 4
+    readonly property real dockWindowThickness: dockEffectiveThickness + 2
+    readonly property real dockSurfaceThickness: dockEffectiveThickness - 2
+    readonly property real dockContentThickness: dockEffectiveThickness - 4
     readonly property real dockWindowLength: root.itemsCount * dockItemSize + dockPadding + 4
     readonly property real dockSurfaceLength: root.itemsCount * dockItemSize + dockPadding
     readonly property real dockContentLength: root.itemsCount * dockItemSize + dockPadding - 10
@@ -1393,7 +1399,7 @@ Item {
                         shell: root.shell
                         iconBaseSize: root.dockIconSize
                         dockItemSize: root.dockItemSize
-                        dockThickness: root.dockThickness
+                        dockThickness: root.dockEffectiveThickness
                         hoverScale: root.dockHoverScale
                         dragScale: root.dockDragScale
                         showRunningDots: root.dockShowRunningDots
