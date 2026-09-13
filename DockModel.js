@@ -17,8 +17,8 @@ var DEFAULT_SETTINGS = {
     iconSize: 38,
     itemSize: 80,
     padding: 48,
-    hoverScale: 2,
-    dragScale: 2,
+    hoverScale: 1.35,
+    dragScale: 1.5,
     backgroundOpacity: 0.98,
     showRunningDots: true,
     showTooltips: true,
@@ -29,21 +29,49 @@ var DEFAULT_SETTINGS = {
     visualizerBars: 32,
     monitor: "",
     floatingWindowScaleX: 0.75,
-    floatingWindowScaleY: 0.75
+    floatingWindowScaleY: 0.75,
+    floatOffsetPrimaryOnly: true,
+    hoverEffect: "zoom",
+    placement: "auto",
+    barPadding: 48,
+    openWindowMode: "tiled",
+    combineGroups: true,
+    iconTintMode: "auto",
+    iconTintColor: "accent",
+    iconTintStrength: 1.0
 };
+
+var HOVER_EFFECTS = ["none", "zoom", "bounce", "lift", "glow", "pulse"];
+
+var PLACEMENT_OPTIONS = ["auto", "top", "bottom", "left", "right"];
+
+// Whether fresh/new windows open tiled (default) or floating. Super-held
+// launches invert the default in either mode.
+var OPEN_WINDOW_MODES = ["tiled", "floating"];
+
+// Theme tint for dock icons (MultiEffect colorization, cf. Omarchy tray
+// symbolic tint). "none" = full-color, "all" = tint every icon,
+// "symbolic" = only *-symbolic names, "auto" = only monochrome-looking
+// sources (HighContrast/monochrome/symbolic/-light/-dark markers).
+var ICON_TINT_MODES = ["none", "auto", "all", "symbolic"];
+
+// Theme color the tint resolves to in DockPanel (Color.accent etc.).
+var ICON_TINT_COLORS = ["accent", "foreground", "barText"];
 
 var SETTINGS_CLAMPS = {
     iconSize: { min: 12, max: 128 },
     itemSize: { min: 24, max: 160 },
     padding: { min: 0, max: 48 },
-    hoverScale: { min: 1.0, max: 2.0 },
+    hoverScale: { min: 1.0, max: 3.0 },
     dragScale: { min: 1.0, max: 2.5 },
     backgroundOpacity: { min: 0.0, max: 1.0 },
     showTooltipsDelay: { min: 0, max: 5000 },
     longPressDuration: { min: 300, max: 2000 },
     visualizerBars: { min: 4, max: 64 },
     floatingWindowScaleX: { min: 0.1, max: 1.0 },
-    floatingWindowScaleY: { min: 0.1, max: 1.0 }
+    floatingWindowScaleY: { min: 0.1, max: 1.0 },
+    barPadding: { min: 0, max: 256 },
+    iconTintStrength: { min: 0.0, max: 1.0 }
 };
 
 function clampNumber(value, min, max, fallback) {
@@ -98,6 +126,16 @@ function parseSettings(raw) {
             }
         } else if (clamp) {
             out[key] = clampNumber(val, clamp.min, clamp.max, def);
+        } else if (key === "hoverEffect") {
+            out[key] = (HOVER_EFFECTS.indexOf(val) !== -1) ? val : def;
+        } else if (key === "placement") {
+            out[key] = (PLACEMENT_OPTIONS.indexOf(val) !== -1) ? val : def;
+        } else if (key === "openWindowMode") {
+            out[key] = (OPEN_WINDOW_MODES.indexOf(val) !== -1) ? val : def;
+        } else if (key === "iconTintMode") {
+            out[key] = (ICON_TINT_MODES.indexOf(val) !== -1) ? val : def;
+        } else if (key === "iconTintColor") {
+            out[key] = (ICON_TINT_COLORS.indexOf(val) !== -1) ? val : def;
         } else {
             out[key] = (val === undefined || val === null) ? def : val;
         }
@@ -118,6 +156,16 @@ function serializeSettings(settings) {
             cleaned[key] = (val === undefined || val === null) ? def : (typeof val === "string" ? val !== "false" && val !== "0" && val !== "" : val !== false);
         } else if (clamp) {
             cleaned[key] = clampNumber(val, clamp.min, clamp.max, def);
+        } else if (key === "hoverEffect") {
+            cleaned[key] = (HOVER_EFFECTS.indexOf(val) !== -1) ? val : def;
+        } else if (key === "placement") {
+            cleaned[key] = (PLACEMENT_OPTIONS.indexOf(val) !== -1) ? val : def;
+        } else if (key === "openWindowMode") {
+            cleaned[key] = (OPEN_WINDOW_MODES.indexOf(val) !== -1) ? val : def;
+        } else if (key === "iconTintMode") {
+            cleaned[key] = (ICON_TINT_MODES.indexOf(val) !== -1) ? val : def;
+        } else if (key === "iconTintColor") {
+            cleaned[key] = (ICON_TINT_COLORS.indexOf(val) !== -1) ? val : def;
         } else {
             cleaned[key] = (val === undefined || val === null) ? def : val;
         }
@@ -381,7 +429,7 @@ function entryFor(appRows, appId) {
 
 // Attach per-window metadata (workspace, monitor, focus priority) to a toplevel.
 // Workspace/monitor come from the Quickshell HyprlandToplevel attached property.
-function toplevelMeta(toplevel, focusedWorkspaceId, focusedMonitorName, pre) {
+function toplevelMeta(toplevel, focusedWorkspaceId, focusedMonitorName, pre, groupMap) {
     var meta = {
         toplevel: toplevel,
         title: (toplevel && toplevel.title) ? toplevel.title : "",
@@ -392,7 +440,8 @@ function toplevelMeta(toplevel, focusedWorkspaceId, focusedMonitorName, pre) {
         active: !!(toplevel && toplevel.activated),
         onFocusedWorkspace: false,
         onFocusedMonitor: false,
-        minimized: !!(toplevel && toplevel.minimized)
+        minimized: !!(toplevel && toplevel.minimized),
+        groupKey: ""
     };
     // Preferred path: precomputed QML-side info (attached properties are not
     // readable from this library file). Legacy lookup kept as fallback.
@@ -421,6 +470,13 @@ function toplevelMeta(toplevel, focusedWorkspaceId, focusedMonitorName, pre) {
     }
     if (focusedMonitorName && meta.monitorName === focusedMonitorName) {
         meta.onFocusedMonitor = true;
+    }
+    // Hyprland group membership from the QML-side hyprctl probe (bare
+    // lowercase hex address -> canonical group key). Empty key = solo and
+    // never merges, so an empty/stale probe changes nothing.
+    if (groupMap && typeof groupMap === "object") {
+        var gbare = String(meta.address || "").toLowerCase().replace(/^0x/, "");
+        if (gbare && groupMap[gbare]) meta.groupKey = String(groupMap[gbare]);
     }
     return meta;
 }
@@ -478,7 +534,7 @@ function cycleWindow(windows, activeToplevel, direction) {
     return arr[next];
 }
 
-function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appRows, appLibrary, minimizedIds, focusedWorkspaceId, focusedMonitorName, minimizedAddrSet, minimizedClassTitleSet, toplevelInfos) {
+function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appRows, appLibrary, minimizedIds, focusedWorkspaceId, focusedMonitorName, minimizedAddrSet, minimizedClassTitleSet, toplevelInfos, groupMap, combineGroups) {
     var pinned = Array.isArray(pinnedIds) ? pinnedIds : [];
     var list = toArray(toplevels);
 
@@ -529,7 +585,7 @@ function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appR
         var rinfo = runningMap[rk];
         var metas = [];
         for (var w = 0; w < rinfo.raw.length; w++) {
-            var wm = toplevelMeta(rinfo.raw[w], focusedWorkspaceId, focusedMonitorName, infoMap.get(rinfo.raw[w]));
+            var wm = toplevelMeta(rinfo.raw[w], focusedWorkspaceId, focusedMonitorName, infoMap.get(rinfo.raw[w]), groupMap);
             // Per-window "parked on special:minimized" state. EXCLUSIVE sources:
             // address-carrying metas trust only the exact address match — the
             // class+title heuristic applies solely to address-less snapshots,
@@ -551,6 +607,67 @@ function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appR
         rinfo.hasMultipleWindows = rinfo.raw.length > 1;
     }
 
+    // Merge Hyprland-grouped windows into shared buckets. groupKey is the
+    // probe's canonical key (sorted member addresses); keys uniting 2+ live
+    // windows form one dock item, everything else stays per-app. Grouped
+    // members are removed from their per-app entries (toplevels/windows/
+    // isActive rewritten to the remaining solos) so counts never double.
+    // Disabled via combineGroups:false.
+    var groupBuckets = {};
+    var groupOrder = [];
+    var bucketsForApp = {};
+    if (combineGroups !== false && groupMap && typeof groupMap === "object") {
+        var keyCount = {};
+        for (var ck in runningMap) {
+            var cws = runningMap[ck].windows;
+            for (var ci = 0; ci < cws.length; ci++) {
+                var ckey = cws[ci].groupKey || "";
+                if (ckey) keyCount[ckey] = (keyCount[ckey] || 0) + 1;
+            }
+        }
+        for (var gk in runningMap) {
+            var gr = runningMap[gk];
+            var soloMetas = [];
+            for (var gim = 0; gim < gr.windows.length; gim++) {
+                var gmem = gr.windows[gim];
+                var gkey = gmem.groupKey || "";
+                if (gkey && (keyCount[gkey] || 0) >= 2) {
+                    if (!groupBuckets[gkey]) {
+                        groupBuckets[gkey] = [];
+                        groupOrder.push(gkey);
+                    }
+                    groupBuckets[gkey].push({ appId: gk, meta: gmem });
+                } else {
+                    soloMetas.push(gmem);
+                }
+            }
+            gr.windows = soloMetas;
+            gr.toplevels = [];
+            gr.isActive = false;
+            for (var ssi = 0; ssi < soloMetas.length; ssi++) {
+                gr.toplevels.push(soloMetas[ssi].toplevel);
+                if (soloMetas[ssi].active || soloMetas[ssi].toplevel === activeToplevel) gr.isActive = true;
+            }
+            gr.hasMultipleWindows = gr.toplevels.length > 1;
+        }
+        for (var go = 0; go < groupOrder.length; go++) {
+            var gko = groupOrder[go];
+            var seenApps = {};
+            var gms = groupBuckets[gko];
+            for (var goi = 0; goi < gms.length; goi++) {
+                var gaid = gms[goi].appId;
+                if (seenApps[gaid]) continue;
+                seenApps[gaid] = true;
+                if (!bucketsForApp[gaid]) bucketsForApp[gaid] = [];
+                bucketsForApp[gaid].push(gko);
+            }
+        }
+    }
+
+    function bucketKeysFor(appId) {
+        return bucketsForApp[appId] || [];
+    }
+
     function enrichItem(base) {
         var entry = entryFor(appRows, base.appId);
         if (entry && appLibrary) {
@@ -565,6 +682,54 @@ function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appR
 
     var items = [];
     var seen = {};
+    var emittedGroups = {};
+
+    // Emit one combined item for a Hyprland group. Icon/name/desktop-entry
+    // resolve from the focused member's app (live-updating); pinning the
+    // group pins that app. Minimized only when every member is parked.
+    function emitGroupItem(gkey) {
+        if (emittedGroups[gkey]) return;
+        emittedGroups[gkey] = true;
+        var members = groupBuckets[gkey] || [];
+        if (members.length === 0) return;
+        var fapp = members[0].appId;
+        for (var ffi = 0; ffi < members.length; ffi++) {
+            if (members[ffi].meta.active) {
+                fapp = members[ffi].appId;
+                break;
+            }
+        }
+        var anyPinned = false;
+        var gtops = [];
+        var gmetas = [];
+        var gactive = false;
+        var gallDocked = true;
+        for (var egi = 0; egi < members.length; egi++) {
+            if (isPinned(pinned, members[egi].appId)) anyPinned = true;
+            gtops.push(members[egi].meta.toplevel);
+            gmetas.push(members[egi].meta);
+            if (members[egi].meta.active) gactive = true;
+            if (!members[egi].meta.isDocked) gallDocked = false;
+        }
+        var gitem = {
+            id: "grp_" + gkey,
+            appId: fapp,
+            appClass: fapp,
+            exec: fapp,
+            name: fapp,
+            icon: fapp,
+            isPinned: anyPinned,
+            isRunning: true,
+            isActive: gactive,
+            isMinimized: gallDocked,
+            windowCount: members.length,
+            toplevels: gtops,
+            windows: sortWindows(gmetas),
+            hasMultipleWindows: true,
+            isGroup: true
+        };
+        items.push(enrichItem(gitem));
+    }
 
     // 1. Pinned Apps in specified order (skip if blacklisted)
     for (var j = 0; j < pinned.length; j++) {
@@ -572,6 +737,11 @@ function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appR
         if (!pid || seen[pid]) continue;
         if (isBlacklisted(blacklistIds, pid)) continue;
         seen[pid] = true;
+
+        // Group buckets containing this pinned app take the pinned slot
+        // (remaining solo windows keep their own pinned entry below).
+        var pbkts = bucketKeysFor(pid);
+        for (var pb = 0; pb < pbkts.length; pb++) emitGroupItem(pbkts[pb]);
 
         var runInfo = runningMap[pid];
         var isRun = runInfo && runInfo.toplevels.length > 0;
@@ -599,9 +769,19 @@ function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appR
         var rid = runningOrder[k];
         if (seen[rid]) continue;
         if (isBlacklisted(blacklistIds, rid)) continue;
-        seen[rid] = true;
 
         var rInfo = runningMap[rid];
+        var rbkts = bucketKeysFor(rid);
+        var hasSolos = rInfo && rInfo.toplevels.length > 0;
+        // Fully absorbed into an emitted group with no solos left: nothing
+        // per-app to show (the bucket emits via its first member below).
+        if (!hasSolos && rbkts.length === 0) continue;
+        if (!hasSolos) {
+            for (var rb0 = 0; rb0 < rbkts.length; rb0++) emitGroupItem(rbkts[rb0]);
+            continue;
+        }
+        seen[rid] = true;
+
         var unpinnedItem = {
             id: "run_" + rid,
             appId: rid,
@@ -619,6 +799,7 @@ function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appR
             hasMultipleWindows: rInfo.hasMultipleWindows
         };
         items.push(enrichItem(unpinnedItem));
+        for (var rb = 0; rb < rbkts.length; rb++) emitGroupItem(rbkts[rb]);
     }
 
     // 3. Minimized Apps that are no longer visible in the toplevel list

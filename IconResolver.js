@@ -81,6 +81,74 @@ function sanitizeName(name) {
         .replace(/\.desktop$/, "");
 }
 
+// Strip URL query/fragment (e.g. image://...?path=...) before name checks.
+function stripIconParams(src) {
+    var s = String(src || "");
+    var q = s.indexOf("?");
+    if (q >= 0) s = s.slice(0, q);
+    var h = s.indexOf("#");
+    if (h >= 0) s = s.slice(0, h);
+    return s;
+}
+
+function isSymbolicSource(src) {
+    var s = stripIconParams(src).toLowerCase();
+    // Match a trailing -symbolic on the basename (with or without extension)
+    // so "foo-symbolic" and "foo-symbolic.svg" both count, but "mysymbolic"
+    // does not.
+    return /(^|\/)-?symbolic(\.[a-z0-9]+)?$/.test(s) || s.slice(-9) === "-symbolic";
+}
+
+// Filename heuristic for monochrome icon sets (HighContrast, -light/-dark
+// variants, mono builds). Pixel-content analysis is not feasible cheaply in
+// QML per-icon, so "auto" tint mode relies on these markers: brand-color
+// icons without such markers are left full-color.
+function isMonochromeSource(src) {
+    if (!src) return false;
+    var s = stripIconParams(src).toLowerCase();
+    if (isSymbolicSource(s)) return true;
+    if (s.indexOf("highcontrast") !== -1) return true;
+    if (s.indexOf("monochrome") !== -1) return true;
+    if (s.indexOf("symbolic") !== -1) return true;
+    // -light/-dark/-black/-white/-mono suffix before the extension, e.g.
+    // "ghostty-light.svg", "tmux-dark.svg", "lmstudio-dark.png"
+    if (/[-_](light|dark|black|white|mono)\.[a-z0-9]+$/.test(s)) return true;
+    // .../light/... or .../dark/... path segment
+    if (/\/(light|dark|black|white|mono)\//.test(s)) return true;
+    return false;
+}
+
+// Should the icon for an app be theme-tinted under the given mode?
+// mode: "none" (never), "all" (always), "symbolic" (only *-symbolic),
+// anything else ("auto"/undefined) = only monochrome-looking sources.
+// Candidates cover the user override, the library icon name, the resolved
+// icon and the raw app identifiers so file:// custom icons keep their
+// filename markers even after iconSource() rewrites theme icons to
+// image:// URLs (which lose the filename).
+function shouldTintIconFor(appClass, appName, appId, mode) {
+    var m = String(mode || "auto").toLowerCase();
+    if (m === "none") return false;
+    if (m === "all") return true;
+    var candidates = [];
+    var custom = getCustomIcon(appId || appClass || appName);
+    if (custom) candidates.push(custom);
+    if (appName) candidates.push(appName);
+    var resolved = resolveIcon(appClass, appName, appId);
+    if (resolved) candidates.push(resolved);
+    if (appClass) candidates.push(appClass);
+    if (appId) candidates.push(appId);
+    for (var i = 0; i < candidates.length; i++) {
+        var c = candidates[i];
+        if (!c) continue;
+        if (m === "symbolic") {
+            if (isSymbolicSource(c)) return true;
+        } else {
+            if (isMonochromeSource(c)) return true;
+        }
+    }
+    return false;
+}
+
 function resolveIcon(appClass, appName, appId) {
     var checkId = appId || appClass || appName || "";
     var custom = getCustomIcon(checkId);

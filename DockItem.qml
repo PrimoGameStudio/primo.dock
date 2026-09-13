@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Effects
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
@@ -26,6 +27,21 @@ Item {
     property int systemRounding: 12
     property bool isSelected: false
     property int longPressDuration: 600
+    property string hoverEffect: "zoom"
+    property real pulseScale: 1.0
+    // Omarchy theme tint for monochrome icons (MultiEffect colorization,
+    // cf. omarchy tray symbolic tint). Bound from DockPanel dockSettings so
+    // theme switches propagate live via the Color singleton.
+    property string iconTintMode: "auto"
+    property color iconTintColor: Color.accent
+    property real iconTintStrength: 1.0
+    readonly property bool shouldTintIcon: {
+        if (root.iconTintStrength <= 0) return false
+        var mode = String(root.iconTintMode || "auto")
+        if (mode === "none") return false
+        if (!root.itemData) return mode === "all"
+        return IconResolver.shouldTintIconFor(root.itemData.appClass, root.itemData.icon, root.itemData.appId, mode)
+    }
     readonly property bool containsMouse: mouseArea.containsMouse
 
     signal moveRequested(int fromIdx, int toIdx)
@@ -35,21 +51,66 @@ Item {
     signal itemLaunchRequested(var item, bool superHeld)
     signal newWindowRequested(var item, bool superHeld)
 
+    clip: false
+    transformOrigin: Item.Center
     implicitWidth: root.dockItemSize - 4
     implicitHeight: root.dockItemSize - 4
     width: root.dockItemSize - 4
     height: root.dockItemSize - 4
     z: isDragging ? 100 : (isSelected ? 60 : (mouseArea.containsMouse ? 50 : 1))
 
-    // Main animated icon wrapper (strictly centered)
+    Behavior on x { NumberAnimation { duration: 130; easing.type: Easing.OutCubic } }
+    Behavior on y { NumberAnimation { duration: 130; easing.type: Easing.OutCubic } }
+
+    // Glow-only layered aura (lift is pure float with no background)
+    readonly property bool isGlowHovered: root.hoverEffect === "glow" && mouseArea.containsMouse && !root.isDragging
+
+    Rectangle {
+        id: glowOuter
+        anchors.centerIn: parent
+        width: root.dockItemSize + 6
+        height: root.dockItemSize + 6
+        radius: root.systemRounding + 4
+        color: Color.composed("bar.accent", "bar.accent-alpha", Color.accent, 0.18)
+        visible: opacity > 0
+        opacity: root.isGlowHovered ? 1.0 : 0.0
+        Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+    }
+
+    Rectangle {
+        id: glowInner
+        anchors.centerIn: parent
+        width: root.dockItemSize - 6
+        height: root.dockItemSize - 6
+        radius: root.systemRounding
+        color: Color.composed("bar.background", "bar.background-alpha", Color.bar.background, 0.35)
+        border.color: Color.accent
+        border.width: 1
+        visible: opacity > 0
+        opacity: root.isGlowHovered ? 1.0 : 0.0
+        Behavior on opacity { NumberAnimation { duration: 150; easing.type: Easing.OutCubic } }
+    }
+
+    // Pulse animation for pulse effect
+    SequentialAnimation {
+        id: pulseAnim
+        running: root.hoverEffect === "pulse" && mouseArea.containsMouse && !root.isDragging
+        loops: Animation.Infinite
+        NumberAnimation { target: root; property: "pulseScale"; to: 1.15; duration: 500; easing.type: Easing.InOutSine }
+        NumberAnimation { target: root; property: "pulseScale"; to: 0.92; duration: 500; easing.type: Easing.InOutSine }
+    }
+
+    // Main animated icon wrapper (strictly centered) — must not clip when scaling outside panel
     Item {
         id: iconWrapper
         anchors.centerIn: parent
+        clip: false
         width: root.iconBaseSize
         height: root.iconBaseSize
+        transformOrigin: Item.Center
 
-        // Smooth subtle hover and drag zoom
-        scale: root.isDragging ? root.dragScale : (mouseArea.containsMouse ? root.hoverScale : 1.0)
+        // Smooth subtle hover and drag zoom — overflow is handled by enlarged transparent PanelWindow
+        scale: (root.isDragging ? root.dragScale : root.hoverScale) * (root.hoverEffect === "pulse" ? root.pulseScale : 1.0)
         opacity: root.isDragging ? 0.92 : (root.itemData && root.itemData.isMinimized ? 0.55 : 1.0)
         Behavior on scale { NumberAnimation { duration: 130; easing.type: Easing.OutCubic } }
         Behavior on opacity { NumberAnimation { duration: 130; easing.type: Easing.OutCubic } }
@@ -66,6 +127,12 @@ Item {
             smooth: true
             mipmap: true
             asynchronous: true
+            // Hidden once tinted (the MultiEffect below samples it as a
+            // texture via layer.enabled, same pattern as omarchy tray
+            // symbolic icons) — but stay visible until loaded so the
+            // fallback glyph (a child) can still show.
+            visible: !root.shouldTintIcon || appIconImage.status !== Image.Ready
+            layer.enabled: root.shouldTintIcon
 
             source: {
                 if (!root.itemData) return ""
@@ -75,16 +142,27 @@ Item {
                 var custom = IconResolver.getCustomIcon(root.itemData.appId)
                 var iconName = custom || root.itemData.icon || ""
                 var resolved = IconResolver.resolveIcon(root.itemData.appClass, root.itemData.icon, root.itemData.appId)
-                var candidates = [iconName]
-                if (resolved && resolved !== iconName) candidates.push(resolved)
+                var candidates = []
+                if (resolved) {
+                    candidates.push(resolved)
+                    if (resolved === "google-chrome") {
+                        candidates.push("google-chrome-stable", "chromium", "chromium-browser", "web-browser")
+                    }
+                }
+                if (iconName && iconName !== resolved) candidates.push(iconName)
                 candidates.push(root.itemData.appClass, root.itemData.appId)
                 for (var i = 0; i < candidates.length; i++) {
+                    var c = candidates[i]
+                    if (!c) continue
+                    if (c.indexOf("file://") === 0 || c.indexOf("/") === 0) {
+                        return c
+                    }
                     var s = ""
                     if (root.shell && root.shell.appLibrary && typeof root.shell.appLibrary.iconSource === "function") {
-                        s = root.shell.appLibrary.iconSource(candidates[i])
+                        s = root.shell.appLibrary.iconSource(c)
                     }
                     if (!s || s.length === 0) {
-                        s = Quickshell.iconPath(candidates[i], true)
+                        s = Quickshell.iconPath(c, true)
                     }
                     if (s && s.length > 0 && s.indexOf("application-x-executable") === -1) return s
                 }
@@ -101,6 +179,18 @@ Item {
                 font.pixelSize: 14
                 color: Color.accent
             }
+        }
+
+        // Theme-tinted copy of the icon for monochrome sources. Color-bound
+        // to the Omarchy palette, so active theme switches apply live.
+        MultiEffect {
+            anchors.centerIn: parent
+            width: root.iconBaseSize
+            height: root.iconBaseSize
+            source: appIconImage
+            visible: root.shouldTintIcon && appIconImage.status === Image.Ready
+            colorization: Math.max(0, Math.min(1, root.iconTintStrength))
+            colorizationColor: root.iconTintColor
         }
 
         // Apple signature launch bounce animation

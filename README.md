@@ -18,6 +18,8 @@ A native, highly polished animated application dock designed for **Omarchy Quatt
 -  **Seamless Omarchy Theme Sync** — Automatically synchronizes with your active Omarchy system colors, accent borders, glassmorphism opacities, and window corner radiuses.
 -  **Live Status Indicators** — Glowing accent dots beneath each icon display active running states (one dot per open window, highlighting the currently active window).
 -  **Dynamic Positioning** — Intelligently detects and adapts to screen dimensions and Omarchy bar placement (top, bottom, left, or right).
+-  **Configurable Dock Placement** — `"placement": "auto"` parks the dock opposite the bar, or pin it manually (`"top"`, `"bottom"`, `"left"`, `"right"`). Sharing the bar's edge nudges the dock inward by `"barPadding"` px (default 48, 0–256).
+-  **Configurable Hover Effects** — Choose from multiple fluid hover effects (`zoom`, `lift`, `bounce`, `glow`, `pulse`) with smooth magnification wave physics and glowing auras.
 -  **Quickshell & IPC Integration** — Fully integrated with Omarchy shell lifecycle management and direct IPC controls (`primo.dock`).
 
 ---

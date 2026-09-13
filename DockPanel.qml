@@ -49,13 +49,57 @@ Item {
     property string shellConfigPath: Quickshell.env("HOME") + "/.config/omarchy/shell.json"
     property string detectedBarPosition: "top"
 
-    // Live bar position (only used to position the dock on the opposite side of the screen)
+    // Live bar position (where the Omarchy bar sits)
     property string barPosition: {
         if (shell && shell.bar && shell.bar.position) return shell.bar.position
         if (shell && shell.barConfig && shell.barConfig.position) return shell.barConfig.position
         return detectedBarPosition
     }
-    readonly property bool isVertical: barPosition === "left" || barPosition === "right"
+    // Dock edge: manual placement, or "auto" = opposite side from the bar
+    readonly property string dockSide: {
+        var p = root.dockPlacement
+        if (p === "top" || p === "bottom" || p === "left" || p === "right") return p
+        if (barPosition === "top") return "bottom"
+        if (barPosition === "bottom") return "top"
+        if (barPosition === "left") return "right"
+        if (barPosition === "right") return "left"
+        return "bottom"
+    }
+    // True when the dock shares an edge with the bar (manual placement onto the bar's edge)
+    readonly property bool dockOverlapsBar: root.dockSide === root.barPosition
+    // True only when the dock sits strictly opposite the bar — the one geometry
+    // where its screen reservation cannot collide with the bar's. Same-edge and
+    // adjacent-edge placements must not reserve, or the bar gets shortened/shoved.
+    readonly property bool dockClearsBar: {
+        if (root.dockSide === "top") return root.barPosition === "bottom"
+        if (root.dockSide === "bottom") return root.barPosition === "top"
+        if (root.dockSide === "left") return root.barPosition === "right"
+        return root.barPosition === "left"
+    }
+    // Inward nudge when the dock shares the bar's edge (dropped when the bar hides)
+    readonly property int dockEdgeNudge: (root.dockOverlapsBar && !root.barHidden) ? root.dockBarPadding : 0
+    // Signed floating-window clearance away from the dock edge.
+    // Magnitude matches the legacy ITEM_SIZE/2 shift exactly (bash truncates, hence floor).
+    readonly property int dockFloatOffsetX: {
+        var c = Math.floor(root.dockItemSize / 2)
+        if (root.dockSide === "left") return c
+        if (root.dockSide === "right") return -c
+        return 0
+    }
+    readonly property int dockFloatOffsetY: {
+        var c = Math.floor(root.dockItemSize / 2)
+        if (root.dockSide === "top") return c
+        if (root.dockSide === "bottom") return -c
+        return 0
+    }
+    // When true, the dock-edge clearance above only shifts windows floating
+    // on the display that hosts the dock; windows on other displays center
+    // exactly. The dock screen name is compared inside the float scripts.
+    readonly property bool dockFloatOffsetPrimaryOnly: dockSettings.floatOffsetPrimaryOnly !== false
+    readonly property string dockScreenName: (root.targetScreen && root.targetScreen.name) ? String(root.targetScreen.name) : ""
+    // Edge gap: base gap plus barPadding nudge when sharing the bar's edge
+    readonly property int dockEdgeGap: (Style.gapsOut || 5) + root.dockEdgeNudge
+    readonly property bool isVertical: dockSide === "left" || dockSide === "right"
 
     // Direct IPC handler for primo.dock target
     IpcHandler {
@@ -337,8 +381,7 @@ Item {
         if (!cls) return
         var ratioX = root.dockFloatingWindowScaleX
         var ratioY = root.dockFloatingWindowScaleY
-        var itemSize = root.dockItemSize
-        var script = "CLS=" + Util.shellQuote(cls) + "; RATIO_X=" + Util.shellQuote(String(ratioX)) + "; RATIO_Y=" + Util.shellQuote(String(ratioY)) + "; ITEM_SIZE=" + Util.shellQuote(String(itemSize)) + "; "
+        var script = "CLS=" + Util.shellQuote(cls) + "; RATIO_X=" + Util.shellQuote(String(ratioX)) + "; RATIO_Y=" + Util.shellQuote(String(ratioY)) + "; OFF_X=" + Util.shellQuote(String(root.dockFloatOffsetX)) + "; OFF_Y=" + Util.shellQuote(String(root.dockFloatOffsetY)) + "; PRIMARY_MON=" + Util.shellQuote(root.dockScreenName) + "; OFFSET_ONLY=" + (root.dockFloatOffsetPrimaryOnly ? "1" : "0") + "; "
             + "BEFORE=$(hyprctl clients -j | jq -r '.[].address' | sort); "
             + "for i in $(seq 1 60); do "
             + "ADDR=$(hyprctl clients -j | jq -r --arg c \"$CLS\" '.[] | select(.class == $c) | .address' | sort | comm -13 <(printf '%s\\n' \"$BEFORE\") - | head -n1); "
@@ -348,12 +391,14 @@ Item {
             + "for _ in 1 2 3 4 5; do FLOAT=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .floating'); if [ \"$FLOAT\" = \"true\" ]; then break; fi; sleep 0.1; done; "
             + "if [ \"$FLOAT\" != \"true\" ]; then exit 0; fi; "
             + "MON=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .monitor'); "
+            + "MON_NAME=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .name'); "
+            + "if [ \"$OFFSET_ONLY\" = \"1\" ] && [ -n \"$MON_NAME\" ] && [ -n \"$PRIMARY_MON\" ] && [ \"$MON_NAME\" != \"$PRIMARY_MON\" ]; then OX=0; OY=0; else OX=$OFF_X; OY=$OFF_Y; fi; "
             + "MW=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .width'); MH=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .height'); MX=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .x'); MY=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .y'); SCALE=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .scale'); "
             + "if [ -z \"$MW\" ] || [ \"$MW\" = \"null\" ] || [ -z \"$MH\" ] || [ \"$MH\" = \"null\" ]; then MW=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .width'); MH=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .height'); MX=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .x'); MY=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .y'); SCALE=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .scale'); fi; "
             + "if [ -z \"$SCALE\" ] || [ \"$SCALE\" = \"null\" ]; then SCALE=1; fi; "
             + "if [ -n \"$MW\" ] && [ -n \"$MH\" ] && [ \"$MW\" != \"null\" ] && [ \"$MH\" != \"null\" ]; then "
             + "NW=$(awk -v mw=\"$MW\" -v s=\"$SCALE\" -v r=\"$RATIO_X\" 'BEGIN{printf \"%d\", mw/s*r}'); NH=$(awk -v mh=\"$MH\" -v s=\"$SCALE\" -v r=\"$RATIO_Y\" 'BEGIN{printf \"%d\", mh/s*r}'); MWL=$(awk -v mw=\"$MW\" -v s=\"$SCALE\" 'BEGIN{printf \"%d\", mw/s}'); MHL=$(awk -v mh=\"$MH\" -v s=\"$SCALE\" 'BEGIN{printf \"%d\", mh/s}'); "
-            + "NX=$((MX + (MWL - NW)/2)); NY=$((MY + (MHL - NH)/2 - ITEM_SIZE/2)); "
+            + "NX=$((MX + (MWL - NW)/2 + OX)); NY=$((MY + (MHL - NH)/2 + OY)); "
             + "hyprctl dispatch \"hl.dsp.window.resize({ window = \\\"address:$ADDR\\\", x = $NW, y = $NH })\" 2>/dev/null; "
             + "sleep 0.05; "
             + "hyprctl dispatch \"hl.dsp.window.move({ window = \\\"address:$ADDR\\\", x = $NX, y = $NY })\" 2>/dev/null; "
@@ -371,17 +416,47 @@ Item {
         if (!a) return
         var ratioX = root.dockFloatingWindowScaleX
         var ratioY = root.dockFloatingWindowScaleY
-        var itemSize = root.dockItemSize
-        var script = "ADDR=" + Util.shellQuote(a) + "; RATIO_X=" + Util.shellQuote(String(ratioX)) + "; RATIO_Y=" + Util.shellQuote(String(ratioY)) + "; ITEM_SIZE=" + Util.shellQuote(String(itemSize)) + "; "
+        var script = "ADDR=" + Util.shellQuote(a) + "; RATIO_X=" + Util.shellQuote(String(ratioX)) + "; RATIO_Y=" + Util.shellQuote(String(ratioY)) + "; OFF_X=" + Util.shellQuote(String(root.dockFloatOffsetX)) + "; OFF_Y=" + Util.shellQuote(String(root.dockFloatOffsetY)) + "; PRIMARY_MON=" + Util.shellQuote(root.dockScreenName) + "; OFFSET_ONLY=" + (root.dockFloatOffsetPrimaryOnly ? "1" : "0") + "; "
             + "for _ in 1 2 3 4 5; do FLOAT=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .floating'); if [ \"$FLOAT\" = \"true\" ]; then break; fi; sleep 0.1; done; "
             + "if [ \"$FLOAT\" != \"true\" ]; then exit 0; fi; "
             + "MON=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .monitor'); "
+            + "MON_NAME=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .name'); "
+            + "if [ \"$OFFSET_ONLY\" = \"1\" ] && [ -n \"$MON_NAME\" ] && [ -n \"$PRIMARY_MON\" ] && [ \"$MON_NAME\" != \"$PRIMARY_MON\" ]; then OX=0; OY=0; else OX=$OFF_X; OY=$OFF_Y; fi; "
             + "MW=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .width'); MH=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .height'); MX=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .x'); MY=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .y'); SCALE=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .scale'); "
             + "if [ -z \"$MW\" ] || [ \"$MW\" = \"null\" ] || [ -z \"$MH\" ] || [ \"$MH\" = \"null\" ]; then MW=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .width'); MH=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .height'); MX=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .x'); MY=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .y'); SCALE=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .scale'); fi; "
             + "if [ -z \"$SCALE\" ] || [ \"$SCALE\" = \"null\" ]; then SCALE=1; fi; "
             + "if [ -z \"$MW\" ] || [ -z \"$MH\" ] || [ \"$MW\" = \"null\" ] || [ \"$MH\" = \"null\" ]; then exit 0; fi; "
             + "NW=$(awk -v mw=\"$MW\" -v s=\"$SCALE\" -v r=\"$RATIO_X\" 'BEGIN{printf \"%d\", mw/s*r}'); NH=$(awk -v mh=\"$MH\" -v s=\"$SCALE\" -v r=\"$RATIO_Y\" 'BEGIN{printf \"%d\", mh/s*r}'); MWL=$(awk -v mw=\"$MW\" -v s=\"$SCALE\" 'BEGIN{printf \"%d\", mw/s}'); MHL=$(awk -v mh=\"$MH\" -v s=\"$SCALE\" 'BEGIN{printf \"%d\", mh/s}'); "
-            + "NX=$((MX + (MWL - NW)/2)); NY=$((MY + (MHL - NH)/2 - ITEM_SIZE/2)); "
+            + "NX=$((MX + (MWL - NW)/2 + OX)); NY=$((MY + (MHL - NH)/2 + OY)); "
+            + "hyprctl dispatch \"hl.dsp.window.resize({ window = \\\"address:$ADDR\\\", x = $NW, y = $NH })\" 2>/dev/null; "
+            + "sleep 0.05; "
+            + "hyprctl dispatch \"hl.dsp.window.move({ window = \\\"address:$ADDR\\\", x = $NX, y = $NY })\" 2>/dev/null; "
+        Util.execDetached("bash -c " + Util.shellQuote(script))
+    }
+
+    // Toggle float/tile on a known window address. When toggling
+    // tiled->floating, also resize to floatingWindowScale (default 0.75 =
+    // 3/4) and center — shared by Super+click and the window-list pill.
+    function toggleFloatForAddress(addr) {
+        var a = String(addr || "")
+        if (!a) return
+        var ratioX = root.dockFloatingWindowScaleX
+        var ratioY = root.dockFloatingWindowScaleY
+        var script = "ADDR=" + Util.shellQuote(a) + "; RATIO_X=" + Util.shellQuote(String(ratioX)) + "; RATIO_Y=" + Util.shellQuote(String(ratioY)) + "; OFF_X=" + Util.shellQuote(String(root.dockFloatOffsetX)) + "; OFF_Y=" + Util.shellQuote(String(root.dockFloatOffsetY)) + "; PRIMARY_MON=" + Util.shellQuote(root.dockScreenName) + "; OFFSET_ONLY=" + (root.dockFloatOffsetPrimaryOnly ? "1" : "0") + "; "
+            + "BEFORE_FLOAT=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .floating'); "
+            + "hyprctl dispatch \"hl.dsp.window.float({ window = \\\"address:$ADDR\\\", action = \\\"toggle\\\" })\" 2>/dev/null; RC=$?; "
+            + "[ $RC -ne 0 ] && { hyprctl dispatch \"togglefloating address:$ADDR\" 2>/dev/null; RC=$?; [ $RC -ne 0 ] && hyprctl dispatch \"togglefloating $ADDR\" 2>/dev/null; }; "
+            + "for _ in 1 2 3 4 5 6; do FLOAT=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .floating'); if [ \"$FLOAT\" != \"$BEFORE_FLOAT\" ]; then break; fi; sleep 0.08; done; "
+            + "if [ \"$FLOAT\" != \"true\" ]; then exit 0; fi; "
+            + "MON=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .monitor'); "
+            + "MON_NAME=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .name'); "
+            + "if [ \"$OFFSET_ONLY\" = \"1\" ] && [ -n \"$MON_NAME\" ] && [ -n \"$PRIMARY_MON\" ] && [ \"$MON_NAME\" != \"$PRIMARY_MON\" ]; then OX=0; OY=0; else OX=$OFF_X; OY=$OFF_Y; fi; "
+            + "MW=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .width'); MH=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .height'); MX=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .x'); MY=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .y'); SCALE=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .scale'); "
+            + "if [ -z \"$MW\" ] || [ \"$MW\" = \"null\" ] || [ -z \"$MH\" ] || [ \"$MH\" = \"null\" ]; then MW=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .width'); MH=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .height'); MX=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .x'); MY=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .y'); SCALE=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .scale'); fi; "
+            + "if [ -z \"$SCALE\" ] || [ \"$SCALE\" = \"null\" ]; then SCALE=1; fi; "
+            + "if [ -z \"$MW\" ] || [ -z \"$MH\" ] || [ \"$MW\" = \"null\" ] || [ \"$MH\" = \"null\" ]; then exit 0; fi; "
+            + "NW=$(awk -v mw=\"$MW\" -v s=\"$SCALE\" -v r=\"$RATIO_X\" 'BEGIN{printf \"%d\", mw/s*r}'); NH=$(awk -v mh=\"$MH\" -v s=\"$SCALE\" -v r=\"$RATIO_Y\" 'BEGIN{printf \"%d\", mh/s*r}'); MWL=$(awk -v mw=\"$MW\" -v s=\"$SCALE\" 'BEGIN{printf \"%d\", mw/s}'); MHL=$(awk -v mh=\"$MH\" -v s=\"$SCALE\" 'BEGIN{printf \"%d\", mh/s}'); "
+            + "NX=$((MX + (MWL - NW)/2 + OX)); NY=$((MY + (MHL - NH)/2 + OY)); "
             + "hyprctl dispatch \"hl.dsp.window.resize({ window = \\\"address:$ADDR\\\", x = $NW, y = $NH })\" 2>/dev/null; "
             + "sleep 0.05; "
             + "hyprctl dispatch \"hl.dsp.window.move({ window = \\\"address:$ADDR\\\", x = $NX, y = $NY })\" 2>/dev/null; "
@@ -391,9 +466,16 @@ Item {
     // Unified "Open New Window" semantics shared by middle-click and the ＋ row:
     // prefer the app's own [Desktop Action new-window] command when defined,
     // otherwise force a brand-new instance via the launchApp chain.
+    // New windows open floating when openWindowMode is "floating"; a held
+    // Super key inverts the default in either mode.
+    readonly property bool dockOpenFloating: String(dockSettings.openWindowMode || "tiled") === "floating"
+    function shouldFloatForLaunch(superHeld) {
+        if (superHeld) return !root.dockOpenFloating
+        return root.dockOpenFloating
+    }
     function openNewWindowForItem(item, superHeld) {
         var de = root.resolveDesktopEntry(item)
-        if (superHeld && item) root.floatNextWindowOfClass(String(item.appId || ""))
+        if (item && root.shouldFloatForLaunch(superHeld)) root.floatNextWindowOfClass(String(item.appId || ""))
         var acts = (de && de.actions) ? de.actions : []
         var cap = Math.min(acts.length, root.maxMenuActions)
         for (var i = 0; i < cap; i++) {
@@ -416,15 +498,15 @@ Item {
     // Blank Space Context Menu State
     property bool isDockMenuOpen: false
 
-    // Exact geometric coordinate centering for the overlay menu
+    // Exact geometric coordinate centering for the overlay menu — includes interior overflow offsets
     readonly property real calculatedMenuLeft: {
         var s = root.targetScreen
         var screenW = s ? s.width : 1920
         var dockW = root.isVertical ? root.dockWindowThickness : root.dockSurfaceLength
         var dockLeft = (screenW - dockW) / 2
         var iconCenterX = root.isVertical
-            ? dockLeft + root.dockWindowThickness / 2
-            : dockLeft + (root.dockWindowLength - root.dockContentLength) / 2 + root.menuPositioningIndex * root.dockItemSize + (root.dockItemSize - 4) / 2
+            ? dockLeft + root.dockWindowThickness / 2 + root.dockSurfaceHorizontalOffset
+            : dockLeft + (root.dockWindowLength - root.dockContentLength) / 2 + root.menuPositioningIndex * root.dockItemSize + (root.dockItemSize - 4) / 2 + root.dockSurfaceHorizontalOffset
         var menuW = 230
         var targetLeft = iconCenterX - menuW / 2
         return Math.round(Math.max(6, Math.min(screenW - menuW - 6, targetLeft)))
@@ -436,8 +518,8 @@ Item {
         var dockH = root.isVertical ? root.dockSurfaceLength : root.dockWindowThickness
         var dockTop = (screenH - dockH) / 2
         var iconCenterY = root.isVertical
-            ? dockTop + (root.dockWindowLength - root.dockContentLength) / 2 + root.menuPositioningIndex * root.dockItemSize + (root.dockItemSize - 4) / 2
-            : dockTop + root.dockWindowThickness / 2
+            ? dockTop + (root.dockWindowLength - root.dockContentLength) / 2 + root.menuPositioningIndex * root.dockItemSize + (root.dockItemSize - 4) / 2 + root.dockSurfaceVerticalOffset
+            : dockTop + root.dockWindowThickness / 2 + root.dockSurfaceVerticalOffset
         var menuH = root.isMenuOpen ? root.actionMenuHeight : root.systemMenuHeight
         var targetTop = iconCenterY - menuH / 2
         return Math.round(Math.max(6, Math.min(screenH - menuH - 6, targetTop)))
@@ -564,6 +646,51 @@ Item {
     onMinimizedAddrsChanged: updateDockItems()
     onMinimizedClassTitlesChanged: updateDockItems()
 
+    // Hyprland group tracking (windows joined via togglegroup).
+    // Maps bare lowercase hex address -> canonical group key (sorted member
+    // addresses joined); solo windows map to their own address. Polled like
+    // the minimized probe; Quickshell exposes no group info itself.
+    property var groupMap: ({})
+
+    Process {
+        id: groupProbe
+        property var pending: ({})
+        command: ["bash", "-c", "hyprctl clients -j | jq -r '.[] | .address + \"\\t\" + ((.grouped // []) | join(\",\"))'"]
+        stdout: SplitParser {
+            onRead: function(line) {
+                var value = String(line).trim()
+                if (!value) return
+                var parts = value.split("\t")
+                var addr = String(parts[0] || "").toLowerCase().replace(/^0x/, "")
+                if (!addr) return
+                var rawMembers = String(parts[1] || "").toLowerCase().split(",")
+                var members = []
+                for (var mi = 0; mi < rawMembers.length; mi++) {
+                    var m = String(rawMembers[mi] || "").replace(/^0x/, "")
+                    if (m.length > 0 && members.indexOf(m) === -1) members.push(m)
+                }
+                if (members.indexOf(addr) === -1) members.push(addr)
+                members.sort()
+                groupProbe.pending[addr] = members.join(",")
+            }
+        }
+        onExited: function(exitCode, exitStatus) {
+            var next = groupProbe.pending
+            groupProbe.pending = ({})
+            if (JSON.stringify(root.groupMap) !== JSON.stringify(next)) {
+                root.groupMap = next
+            }
+        }
+    }
+
+    function refreshGroups() {
+        groupProbe.pending = ({})
+        if (!groupProbe.running) groupProbe.running = true
+    }
+
+    onGroupMapChanged: updateDockItems()
+    onDockCombineGroupsChanged: updateDockItems()
+
     // All persistent state lives in primo.dock-settings.json (single file, reads via Process+safeRead.py/StdioCollector, writes via atomic settingsWriter)
     property var pinnedIds: []
     property var blacklistIds: []
@@ -587,6 +714,7 @@ Item {
         onTriggered: {
             barHiddenProbe.running = true
             root.refreshMinimized()
+            root.refreshGroups()
             root.refreshTitlesIfDrifted()
         }
     }
@@ -613,6 +741,14 @@ Item {
     readonly property bool dockShowTooltips: dockSettings.showTooltips !== false
     readonly property int dockLongPressDuration: Number(dockSettings.longPressDuration) || 600
     readonly property bool dockToggleWithBar: dockSettings.toggleWithBar !== false
+    readonly property bool dockCombineGroups: dockSettings.combineGroups !== false
+    readonly property string dockHoverEffect: dockSettings.hoverEffect || "zoom"
+    readonly property string dockPlacement: dockSettings.placement || "auto"
+    readonly property int dockBarPadding: {
+        var v = Number(dockSettings.barPadding)
+        if (!isFinite(v)) return 48
+        return Math.max(0, Math.min(256, Math.round(v)))
+    }
     readonly property bool dockShowVisualizer: dockSettings.showVisualizer !== false
     readonly property int dockVisualizerBars: Number(dockSettings.visualizerBars) || 32
     readonly property real dockFloatingWindowScaleX: {
@@ -624,6 +760,21 @@ Item {
         var v = Number(dockSettings.floatingWindowScaleY)
         if (!isFinite(v)) return 0.75
         return Math.max(0.1, Math.min(1.0, v))
+    }
+
+    // Omarchy theme tint for monochrome dock icons (resolved live from the
+    // Color singleton so theme switches apply without a restart).
+    readonly property string dockIconTintMode: DockModel.ICON_TINT_MODES.indexOf(dockSettings.iconTintMode) !== -1 ? dockSettings.iconTintMode : "auto"
+    readonly property color dockIconTintColor: {
+        var c = String(dockSettings.iconTintColor || "accent")
+        if (c === "foreground") return Color.foreground
+        if (c === "barText") return Color.bar.text
+        return Color.accent
+    }
+    readonly property real dockIconTintStrength: {
+        var v = Number(dockSettings.iconTintStrength)
+        if (!isFinite(v)) return 1.0
+        return Math.max(0, Math.min(1, v))
     }
 
     // Cava audio visualizer process & data array
@@ -676,6 +827,48 @@ Item {
     readonly property real dockWindowLength: root.itemsCount * dockItemSize + dockPadding + 4
     readonly property real dockSurfaceLength: root.itemsCount * dockItemSize + dockPadding
     readonly property real dockContentLength: root.itemsCount * dockItemSize + dockPadding - 10
+
+    // Drag tracking for dynamic length — bubbled up from DockItem isDragging
+    property int draggedIndex: -1
+    readonly property bool isDraggingAny: root.draggedIndex >= 0
+
+    // Hover/drag overflow — icons scale outside the visual card without clipping.
+    // Interior-only: extra transparent padding is on the desktop side, not the screen edge.
+    readonly property real dockMaxScale: Math.max(root.dockHoverScale, root.dockDragScale)
+    readonly property real dockOverflowInterior: Math.max(0, Math.ceil(root.dockIconSize * root.dockMaxScale - root.dockSurfaceThickness)) + 2
+    readonly property real dockSideOverhang: Math.max(0, (root.dockIconSize * root.dockMaxScale - root.dockItemSize) / 2 + 2)
+    // Only magnifying effects (zoom/bounce) and drag need extra window length —
+    // lift/glow/pulse/none stay within their slots, so no pad (avoids phantom shifts).
+    readonly property bool dockEffectMagnifies: root.dockHoverEffect === "zoom" || root.dockHoverEffect === "bounce"
+    // Dynamic horizontal length: only when hover/drag is on the first or last icon does the
+    // window need extra length beyond the card, otherwise neighbours overlap inside window.
+    readonly property real dockDynamicLengthPad: {
+        if (!root.dockEffectMagnifies && !root.isDraggingAny) return 0
+        var idx = root.isDraggingAny ? root.draggedIndex : root.hoveredItemIndex
+        if (idx < 0) return 0
+        if (idx === 0 || idx === root.itemsCount - 1) return Math.ceil(root.dockSideOverhang)
+        return 0
+    }
+    readonly property real dockWindowLengthEffective: root.dockWindowLength + root.dockDynamicLengthPad
+    // Effective window thickness/length including interior overflow
+    readonly property real dockWindowThicknessEffective: root.dockWindowThickness + root.dockOverflowInterior
+    // Offsets for symmetric thickness padding and dynamic overhang
+    readonly property real dockSurfaceVerticalOffset: {
+        if (!root.isVertical) return 0
+        if (root.dockDynamicLengthPad === 0) return 0
+        var didx = root.isDraggingAny ? root.draggedIndex : root.hoveredItemIndex
+        if (didx === 0) return root.dockSideOverhang / 2
+        if (didx === root.itemsCount - 1) return -root.dockSideOverhang / 2
+        return 0
+    }
+    readonly property real dockSurfaceHorizontalOffset: {
+        if (root.isVertical) return 0
+        if (root.dockDynamicLengthPad === 0) return 0
+        var didx = root.isDraggingAny ? root.draggedIndex : root.hoveredItemIndex
+        if (didx === 0) return root.dockSideOverhang / 2
+        if (didx === root.itemsCount - 1) return -root.dockSideOverhang / 2
+        return 0
+    }
 
     // QML-side snapshot of Hyprland per-window data. Attached properties
     // (toplevel.HyprlandToplevel) only resolve inside import context —
@@ -736,7 +929,7 @@ Item {
         var lib = shell ? shell.appLibrary : null
         var fws = Hyprland.focusedWorkspace ? Hyprland.focusedWorkspace.id : undefined
         var fmon = Hyprland.focusedMonitor ? Hyprland.focusedMonitor.name : ""
-        root.dockItems = DockModel.buildDockItems(root.pinnedIds, root.blacklistIds, toplevels, active, root.appRows, lib, root.minimizedIds, fws, fmon, root.minimizedAddrs, root.minimizedClassTitles, root.toplevelInfos)
+        root.dockItems = DockModel.buildDockItems(root.pinnedIds, root.blacklistIds, toplevels, active, root.appRows, lib, root.minimizedIds, fws, fmon, root.minimizedAddrs, root.minimizedClassTitles, root.toplevelInfos, root.groupMap, root.dockCombineGroups)
         rebindOpenMenusToFreshItems()
     }
 
@@ -1095,6 +1288,16 @@ Item {
         root.activeMenuItem = null
     }
 
+    // Toggle tile/float on a single window from the window list.
+    // Operates on the snapshot address (same source as minimize/close);
+    // address-less snapshots are a no-op. Closes the card like its
+    // sibling pills.
+    function toggleWindowFloat(meta) {
+        if (!meta || !meta.address) return
+        root.toggleFloatForAddress(String(meta.address))
+        root.activeMenuItem = null
+    }
+
     // Close every window of an app ("Close All Windows" action)
     function closeAllWindows(item) {
         if (!item || !item.toplevels) return
@@ -1243,30 +1446,42 @@ Item {
         // (e.g. Super held) is delivered before the button event — enables Super+click menus
         WlrLayershell.keyboardFocus: WlrKeyboardFocus.OnDemand
         exclusionMode: (root.opened && root.pluginEnabled && visible && (!root.dockToggleWithBar || !root.barHidden)) ? ExclusionMode.Auto : ExclusionMode.Ignore
+        // Tight exclusive zone = visual card only (78px), interior overflow is transparent padding and must not push tiles.
+        // Reserve only when strictly opposite the bar; same-edge or adjacent-edge
+        // reservations are output-wide and shorten/shove the bar.
+        WlrLayershell.exclusiveZone: (root.opened && root.pluginEnabled && visible && (!root.dockToggleWithBar || !root.barHidden) && root.dockClearsBar) ? Math.round(root.dockSurfaceThickness) : 0
         color: "transparent"
 
         anchors {
-            top: root.barPosition === "bottom"
-            bottom: root.barPosition === "top"
-            left: root.barPosition === "right"
-            right: root.barPosition === "left"
+            top: root.dockSide === "top"
+            bottom: root.dockSide === "bottom"
+            left: root.dockSide === "left"
+            right: root.dockSide === "right"
         }
 
         margins {
-            bottom: (!root.isVertical && root.barPosition === "top") ? ((root.dockToggleWithBar && root.barHidden) ? -(root.dockWindowThickness + 10) : (Style.gapsOut || 5)) : 0
-            top: (!root.isVertical && root.barPosition === "bottom") ? ((root.dockToggleWithBar && root.barHidden) ? -(root.dockWindowThickness + 10) : (Style.gapsOut || 5)) : 0
-            right: (root.isVertical && root.barPosition === "left") ? ((root.dockToggleWithBar && root.barHidden) ? -(root.dockWindowThickness + 10) : (Style.gapsOut || 5)) : 0
-            left: (root.isVertical && root.barPosition === "right") ? ((root.dockToggleWithBar && root.barHidden) ? -(root.dockWindowThickness + 10) : (Style.gapsOut || 5)) : 0
+            bottom: (!root.isVertical && root.dockSide === "bottom") ? ((root.dockToggleWithBar && root.barHidden) ? -(root.dockWindowThicknessEffective + 10) : root.dockEdgeGap) : 0
+            top: (!root.isVertical && root.dockSide === "top") ? ((root.dockToggleWithBar && root.barHidden) ? -(root.dockWindowThicknessEffective + 10) : root.dockEdgeGap) : 0
+            right: (root.isVertical && root.dockSide === "right") ? ((root.dockToggleWithBar && root.barHidden) ? -(root.dockWindowThicknessEffective + 10) : root.dockEdgeGap) : 0
+            left: (root.isVertical && root.dockSide === "left") ? ((root.dockToggleWithBar && root.barHidden) ? -(root.dockWindowThicknessEffective + 10) : root.dockEdgeGap) : 0
         }
 
-        // Exact, uncompromised dock dimensions with 2px antialiasing buffer
-        implicitWidth: root.isVertical ? root.dockWindowThickness : root.dockWindowLength
-        implicitHeight: root.isVertical ? root.dockWindowLength : root.dockWindowThickness
+        // Window includes interior overflow (transparent) + card; effective length expands dynamically at ends for side overhang
+        implicitWidth: root.isVertical ? root.dockWindowThicknessEffective : root.dockWindowLengthEffective
+        implicitHeight: root.isVertical ? root.dockWindowLengthEffective : root.dockWindowThicknessEffective
 
-        // Main Visual Dock Card
+        Behavior on implicitWidth { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
+        Behavior on implicitHeight { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
+
+        // Main Visual Dock Card — anchored with offsets so overflow faces interior, card stays flush to screen edge
         Rectangle {
             id: dockSurface
             anchors.centerIn: parent
+            anchors.verticalCenterOffset: root.dockSurfaceVerticalOffset
+            anchors.horizontalCenterOffset: root.dockSurfaceHorizontalOffset
+            clip: false
+            Behavior on anchors.verticalCenterOffset { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
+            Behavior on anchors.horizontalCenterOffset { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
             width: root.isVertical ? root.dockSurfaceThickness : root.dockSurfaceLength
             height: root.isVertical ? root.dockSurfaceLength : root.dockSurfaceThickness
             visible: root.opened && root.pluginEnabled && (!root.dockToggleWithBar || !root.barHidden) && !root.forceRemap
@@ -1352,6 +1567,7 @@ Item {
                 visible: root.dockShowVisualizer
 
                 Row {
+                    visible: !root.isVertical
                     anchors.fill: parent
                     spacing: 2
                     opacity: 0.25
@@ -1372,14 +1588,81 @@ Item {
                         }
                     }
                 }
+
+                Column {
+                    visible: root.isVertical
+                    anchors.fill: parent
+                    spacing: 2
+                    opacity: 0.25
+
+                    Repeater {
+                        model: root.visualizerLevels
+                        delegate: Rectangle {
+                            required property var modelData
+                            height: (parent.height - (root.visualizerLevels.length - 1) * 2) / root.visualizerLevels.length
+                            width: parent.width * Math.max(0.05, modelData)
+                            // Per-side mirroring: grow inward from the screen edge
+                            anchors.left: root.dockSide === "left" ? parent.left : undefined
+                            anchors.right: root.dockSide === "right" ? parent.right : undefined
+                            color: Color.accent
+                            radius: 2
+
+                            Behavior on width {
+                                NumberAnimation { duration: 50 }
+                            }
+                        }
+                    }
+                }
             }
 
             Item {
                 id: dockContent
                 anchors.centerIn: parent
+                clip: false
                 width: root.isVertical ? root.dockContentThickness : root.dockContentLength
                 height: root.isVertical ? root.dockContentLength : root.dockContentThickness
                 z: 1
+
+                MouseArea {
+                    id: dockHoverOverlay
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    acceptedButtons: Qt.NoButton
+                    z: 100
+
+                    property real cursorCoord: root.isVertical ? mouseY : mouseX
+                    property bool mouseInside: containsMouse
+
+                    onPositionChanged: function(mouse) {
+                        cursorCoord = root.isVertical ? mouse.y : mouse.x
+                        if (!root.isDraggingAny && root.itemsCount > 0) {
+                            var idx = Math.max(0, Math.min(root.itemsCount - 1, Math.round((cursorCoord - root.dockItemSize / 2) / root.dockItemSize)))
+                            if (root.hoveredItemIndex !== idx) {
+                                root.hoveredItemIndex = idx
+                                if (root.dockItems.length > idx) {
+                                    tooltipDelayTimer.stop()
+                                    tooltipDelayTimer.pendingData = root.dockItems[idx]
+                                    tooltipDelayTimer.pendingIndex = idx
+                                    if (root.hoveredItemData !== null) {
+                                        root.hoveredItemData = root.dockItems[idx]
+                                    } else {
+                                        tooltipDelayTimer.restart()
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    onEntered: function(mouse) {
+                        mouseInside = true
+                        cursorCoord = root.isVertical ? mouse.y : mouse.x
+                    }
+                    onExited: {
+                        mouseInside = false
+                        root.hoveredItemIndex = -1
+                        root.hoveredItemData = null
+                        tooltipDelayTimer.stop()
+                    }
+                }
 
                 Repeater {
                     model: root.dockItems
@@ -1388,46 +1671,38 @@ Item {
                         itemData: modelData
                         itemIndex: index
                         totalCount: root.itemsCount
-                        barPosition: root.barPosition
+                        barPosition: root.dockSide
                         shell: root.shell
                         iconBaseSize: root.dockIconSize
                         dockItemSize: root.dockItemSize
-                        hoverScale: root.dockHoverScale
+                        hoverEffect: root.dockHoverEffect
+                        hoverScale: {
+                            if (!dockHoverOverlay.mouseInside || root.isDraggingAny) return 1.0
+                            if (root.dockHoverEffect === "none") return 1.0
+                            if (root.dockHoverEffect === "lift") return 1.06
+                            if (root.dockHoverEffect === "glow") return 1.15
+                            if (root.dockHoverEffect === "pulse") return 1.10
+
+                            var itemCenter = index * root.dockItemSize + root.dockItemSize / 2
+                            var dist = Math.abs(dockHoverOverlay.cursorCoord - itemCenter)
+                            var radius = root.dockItemSize * 3.2
+                            if (dist >= radius) return 1.0
+                            var factor = (1.0 + Math.cos(Math.PI * dist / radius)) / 2.0
+                            var maxS = (root.dockHoverEffect === "bounce") ? root.dockHoverScale * 0.85 : root.dockHoverScale
+                            var expansion = (maxS - 1.0) * factor
+                            if (factor < 0.95) expansion *= 0.6
+                            return 1.0 + expansion
+                        }
                         dragScale: root.dockDragScale
                         showRunningDots: root.dockShowRunningDots
                         systemBorderSize: root.systemBorderSize
                         systemRounding: root.systemRounding
                         longPressDuration: root.dockLongPressDuration
+                        iconTintMode: root.dockIconTintMode
+                        iconTintColor: root.dockIconTintColor
+                        iconTintStrength: root.dockIconTintStrength
                         isSelected: (root.activeMenuItem && root.activeMenuItem.appClass === modelData.appClass)
                             || (root.activeSystemItem && root.activeSystemItem.appClass === modelData.appClass)
-
-                        // Update tooltip tracked index and data on hover
-                        onContainsMouseChanged: {
-                            if (containsMouse) {
-                                if (!isDragging) {
-                                    tooltipDelayTimer.stop()
-                                    tooltipDelayTimer.pendingData = modelData
-                                    tooltipDelayTimer.pendingIndex = index
-                                    if (root.hoveredItemData !== null) {
-                                        // If another tooltip is already visible, switch immediately without delay
-                                        root.hoveredItemData = modelData
-                                        root.hoveredItemIndex = index
-                                    } else {
-                                        tooltipDelayTimer.restart()
-                                    }
-                                }
-                            } else {
-                                if (tooltipDelayTimer.pendingIndex === index) {
-                                    tooltipDelayTimer.stop()
-                                    tooltipDelayTimer.pendingData = null
-                                    tooltipDelayTimer.pendingIndex = -1
-                                }
-                                if (root.hoveredItemIndex === index) {
-                                    root.hoveredItemData = null
-                                    root.hoveredItemIndex = -1
-                                }
-                            }
-                        }
 
                         onIsDraggingChanged: {
                             if (isDragging) {
@@ -1436,11 +1711,48 @@ Item {
                                 tooltipDelayTimer.pendingIndex = -1
                                 root.hoveredItemData = null
                                 root.hoveredItemIndex = -1
+                                root.draggedIndex = index
+                            } else if (root.draggedIndex === index) {
+                                root.draggedIndex = -1
                             }
                         }
 
-                        x: root.isVertical ? 0 : (index * root.dockItemSize)
-                        y: root.isVertical ? (index * root.dockItemSize) : 0
+                        x: {
+                            var baseX = root.isVertical ? 0 : index * root.dockItemSize
+                            if (!dockHoverOverlay.mouseInside || root.isDraggingAny) return baseX
+                            // lift: rise toward interior (~10px); glow/pulse/none stay in place
+                            if (root.dockHoverEffect === "lift" && index === root.hoveredItemIndex) {
+                                if (root.dockSide === "left") return baseX + 10
+                                if (root.dockSide === "right") return baseX - 10
+                                return baseX
+                            }
+                            // Neighbour push runs along the dock's long axis only: x for horizontal docks
+                            if (root.isVertical) return baseX
+                            if (root.dockHoverEffect !== "zoom" && root.dockHoverEffect !== "bounce") return baseX
+                            var hoverIdx = root.hoveredItemIndex
+                            if (index === hoverIdx) return baseX
+                            var distFromHover = index - hoverIdx
+                            var pushMagnitude = (hoverScale - 1.0) * root.dockItemSize * 0.20
+                            return baseX + Math.sign(distFromHover) * pushMagnitude * Math.max(0, 3.5 - Math.abs(distFromHover))
+                        }
+                        y: {
+                            var baseY = root.isVertical ? index * root.dockItemSize : 0
+                            if (!dockHoverOverlay.mouseInside || root.isDraggingAny) return baseY
+                            // lift: rise toward interior (~10px); glow/pulse/none stay in place
+                            if (root.dockHoverEffect === "lift" && index === root.hoveredItemIndex) {
+                                if (root.dockSide === "top") return baseY + 10
+                                if (root.dockSide === "bottom") return baseY - 10
+                                return baseY
+                            }
+                            // Neighbour push runs along the dock's long axis only: y for vertical docks
+                            if (!root.isVertical) return baseY
+                            if (root.dockHoverEffect !== "zoom" && root.dockHoverEffect !== "bounce") return baseY
+                            var hoverIdx2 = root.hoveredItemIndex
+                            if (index === hoverIdx2) return baseY
+                            var distFromHover2 = index - hoverIdx2
+                            var pushMagnitude2 = (hoverScale - 1.0) * root.dockItemSize * 0.20
+                            return baseY + Math.sign(distFromHover2) * pushMagnitude2 * Math.max(0, 3.5 - Math.abs(distFromHover2))
+                        }
 
                         onItemLeftClicked: function(item) {
                             root.activeMenuItem = null
@@ -1451,15 +1763,15 @@ Item {
 
                         onItemLaunchRequested: function(item, superHeld) {
                             // Watcher must snapshot before the launch dispatch
-                            if (superHeld && item) root.floatNextWindowOfClass(String(item.appId || ""))
+                            if (item && root.shouldFloatForLaunch(superHeld)) root.floatNextWindowOfClass(String(item.appId || ""))
                             root.launchApp(item)
                         }
 
                         onItemFloatToggleRequested: function(item) {
                             // Toggle float/tile on the window a normal click would
                             // focus: the active one, or the cycle-next candidate.
-                            // When toggling tiled->floating, also resize to
-                            // floatingWindowScale (default 0.75 = 3/4) and center.
+                            // The shared toggle also resizes tiled->floating
+                            // windows to floatingWindowScale and centers them.
                             if (!item) return
                             var wins = item.windows || []
                             var target = null
@@ -1472,27 +1784,7 @@ Item {
                                 if (tops.length > 0) target = { toplevel: tops[0] }
                             }
                             if (!target || !target.address) return
-                            var addr = String(target.address)
-                            var ratioX = root.dockFloatingWindowScaleX
-                            var ratioY = root.dockFloatingWindowScaleY
-                            var itemSize = root.dockItemSize
-                            var script = "ADDR=" + Util.shellQuote(addr) + "; RATIO_X=" + Util.shellQuote(String(ratioX)) + "; RATIO_Y=" + Util.shellQuote(String(ratioY)) + "; ITEM_SIZE=" + Util.shellQuote(String(itemSize)) + "; "
-                                + "BEFORE_FLOAT=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .floating'); "
-                                + "hyprctl dispatch \"hl.dsp.window.float({ window = \\\"address:$ADDR\\\", action = \\\"toggle\\\" })\" 2>/dev/null; RC=$?; "
-                                + "[ $RC -ne 0 ] && { hyprctl dispatch \"togglefloating address:$ADDR\" 2>/dev/null; RC=$?; [ $RC -ne 0 ] && hyprctl dispatch \"togglefloating $ADDR\" 2>/dev/null; }; "
-                                + "for _ in 1 2 3 4 5 6; do FLOAT=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .floating'); if [ \"$FLOAT\" != \"$BEFORE_FLOAT\" ]; then break; fi; sleep 0.08; done; "
-                                + "if [ \"$FLOAT\" != \"true\" ]; then exit 0; fi; "
-                                + "MON=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .monitor'); "
-                                + "MW=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .width'); MH=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .height'); MX=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .x'); MY=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .y'); SCALE=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .scale'); "
-                                + "if [ -z \"$MW\" ] || [ \"$MW\" = \"null\" ] || [ -z \"$MH\" ] || [ \"$MH\" = \"null\" ]; then MW=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .width'); MH=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .height'); MX=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .x'); MY=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .y'); SCALE=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .scale'); fi; "
-                                + "if [ -z \"$SCALE\" ] || [ \"$SCALE\" = \"null\" ]; then SCALE=1; fi; "
-                                + "if [ -z \"$MW\" ] || [ -z \"$MH\" ] || [ \"$MW\" = \"null\" ] || [ \"$MH\" = \"null\" ]; then exit 0; fi; "
-                                + "NW=$(awk -v mw=\"$MW\" -v s=\"$SCALE\" -v r=\"$RATIO_X\" 'BEGIN{printf \"%d\", mw/s*r}'); NH=$(awk -v mh=\"$MH\" -v s=\"$SCALE\" -v r=\"$RATIO_Y\" 'BEGIN{printf \"%d\", mh/s*r}'); MWL=$(awk -v mw=\"$MW\" -v s=\"$SCALE\" 'BEGIN{printf \"%d\", mw/s}'); MHL=$(awk -v mh=\"$MH\" -v s=\"$SCALE\" 'BEGIN{printf \"%d\", mh/s}'); "
-                                + "NX=$((MX + (MWL - NW)/2)); NY=$((MY + (MHL - NH)/2 - ITEM_SIZE/2)); "
-                                + "hyprctl dispatch \"hl.dsp.window.resize({ window = \\\"address:$ADDR\\\", x = $NW, y = $NH })\" 2>/dev/null; "
-                                + "sleep 0.05; "
-                                + "hyprctl dispatch \"hl.dsp.window.move({ window = \\\"address:$ADDR\\\", x = $NX, y = $NY })\" 2>/dev/null; "
-                            Util.execDetached("bash -c " + Util.shellQuote(script))
+                            root.toggleFloatForAddress(String(target.address))
                         }
 
                         onNewWindowRequested: function(item, superHeld) {
@@ -1528,7 +1820,7 @@ Item {
         }
     }
 
-    // 2. Hover Tooltip (Shown when hovering over an icon, floats cleanly above/below/beside dock depending on barPosition)
+    // 2. Hover Tooltip (Shown when hovering over an icon, floats cleanly above/below/beside dock depending on dockSide)
     PanelWindow {
         id: tooltipWindow
         screen: root.targetScreen
@@ -1540,18 +1832,18 @@ Item {
         color: "transparent"
 
         anchors {
-            top: root.barPosition === "bottom" ? true : (root.isVertical ? true : false)
-            bottom: root.barPosition === "top" ? true : false
-            left: root.barPosition === "right" ? true : (!root.isVertical ? true : false)
-            right: root.barPosition === "left" ? true : false
+            top: root.dockSide === "top" ? true : (root.isVertical ? true : false)
+            bottom: root.dockSide === "bottom" ? true : false
+            left: root.dockSide === "left" ? true : (!root.isVertical ? true : false)
+            right: root.dockSide === "right" ? true : false
         }
 
         margins {
             // Match the floating distance above/below/beside the main dock
-            bottom: (!root.isVertical && root.barPosition === "top") ? ((Style.gapsOut || 5) + root.dockItemSize + 4) : 0
-            top: (!root.isVertical && root.barPosition === "bottom") ? ((Style.gapsOut || 5) + root.dockItemSize + 4) : (root.isVertical ? root.calculatedTooltipTop : 0)
-            right: (root.isVertical && root.barPosition === "left") ? ((Style.gapsOut || 5) + root.dockItemSize + 4) : 0
-            left: (root.isVertical && root.barPosition === "right") ? ((Style.gapsOut || 5) + root.dockItemSize + 4) : (!root.isVertical ? root.calculatedTooltipLeft : 0)
+            bottom: (!root.isVertical && root.dockSide === "bottom") ? ((Style.gapsOut || 5) + root.dockItemSize + 4 + root.dockEdgeNudge) : 0
+            top: (!root.isVertical && root.dockSide === "top") ? ((Style.gapsOut || 5) + root.dockItemSize + 4 + root.dockEdgeNudge) : (root.isVertical ? root.calculatedTooltipTop : 0)
+            right: (root.isVertical && root.dockSide === "right") ? ((Style.gapsOut || 5) + root.dockItemSize + 4 + root.dockEdgeNudge) : 0
+            left: (root.isVertical && root.dockSide === "left") ? ((Style.gapsOut || 5) + root.dockItemSize + 4 + root.dockEdgeNudge) : (!root.isVertical ? root.calculatedTooltipLeft : 0)
         }
 
         implicitWidth: tooltipBubble.width
@@ -1587,15 +1879,15 @@ Item {
         }
     }
 
-    // Exact geometric coordinate centering for the tooltip bubble
+    // Exact geometric coordinate centering for the tooltip bubble — includes interior overflow offsets
     readonly property real calculatedTooltipLeft: {
         var s = root.targetScreen
         var screenW = s ? s.width : 1920
         var dockW = root.isVertical ? root.dockWindowThickness : root.dockSurfaceLength
         var dockLeft = (screenW - dockW) / 2
         var iconCenterX = root.isVertical
-            ? dockLeft + root.dockWindowThickness / 2
-            : dockLeft + (root.dockWindowLength - root.dockContentLength) / 2 + root.hoveredItemIndex * root.dockItemSize + (root.dockItemSize - 4) / 2
+            ? dockLeft + root.dockWindowThickness / 2 + root.dockSurfaceHorizontalOffset
+            : dockLeft + (root.dockWindowLength - root.dockContentLength) / 2 + root.hoveredItemIndex * root.dockItemSize + (root.dockItemSize - 4) / 2 + root.dockSurfaceHorizontalOffset
         var targetLeft = iconCenterX - tooltipBubble.width / 2
         return Math.round(Math.max(6, Math.min(screenW - tooltipBubble.width - 6, targetLeft)))
     }
@@ -1606,8 +1898,8 @@ Item {
         var dockH = root.isVertical ? root.dockSurfaceLength : root.dockWindowThickness
         var dockTop = (screenH - dockH) / 2
         var iconCenterY = root.isVertical
-            ? dockTop + (root.dockWindowLength - root.dockContentLength) / 2 + root.hoveredItemIndex * root.dockItemSize + (root.dockItemSize - 4) / 2
-            : dockTop + root.dockWindowThickness / 2
+            ? dockTop + (root.dockWindowLength - root.dockContentLength) / 2 + root.hoveredItemIndex * root.dockItemSize + (root.dockItemSize - 4) / 2 + root.dockSurfaceVerticalOffset
+            : dockTop + root.dockWindowThickness / 2 + root.dockSurfaceVerticalOffset
         var targetTop = iconCenterY - tooltipBubble.height / 2
         return Math.round(Math.max(6, Math.min(screenH - tooltipBubble.height - 6, targetTop)))
     }
@@ -1624,17 +1916,17 @@ Item {
         color: "transparent"
 
         anchors {
-            top: root.barPosition === "bottom" ? true : (root.isVertical ? true : false)
-            bottom: root.barPosition === "top" ? true : false
-            left: root.barPosition === "right" ? true : (!root.isVertical ? true : false)
-            right: root.barPosition === "left" ? true : false
+            top: root.dockSide === "top" ? true : (root.isVertical ? true : false)
+            bottom: root.dockSide === "bottom" ? true : false
+            left: root.dockSide === "left" ? true : (!root.isVertical ? true : false)
+            right: root.dockSide === "right" ? true : false
         }
 
         margins {
-            bottom: (!root.isVertical && root.barPosition === "top") ? ((Style.gapsOut || 5) + 52) : 0
-            top: (!root.isVertical && root.barPosition === "bottom") ? ((Style.gapsOut || 5) + 52) : (root.isVertical ? root.calculatedMenuTop : 0)
-            right: (root.isVertical && root.barPosition === "left") ? ((Style.gapsOut || 5) + 52) : 0
-            left: (root.isVertical && root.barPosition === "right") ? ((Style.gapsOut || 5) + 52) : (!root.isVertical ? root.calculatedMenuLeft : 0)
+            bottom: (!root.isVertical && root.dockSide === "bottom") ? ((Style.gapsOut || 5) + 52 + root.dockEdgeNudge) : 0
+            top: (!root.isVertical && root.dockSide === "top") ? ((Style.gapsOut || 5) + 52 + root.dockEdgeNudge) : (root.isVertical ? root.calculatedMenuTop : 0)
+            right: (root.isVertical && root.dockSide === "right") ? ((Style.gapsOut || 5) + 52 + root.dockEdgeNudge) : 0
+            left: (root.isVertical && root.dockSide === "left") ? ((Style.gapsOut || 5) + 52 + root.dockEdgeNudge) : (!root.isVertical ? root.calculatedMenuLeft : 0)
         }
 
         implicitWidth: 260
@@ -2005,11 +2297,47 @@ Item {
 
                                 Text {
                                     Layout.fillWidth: true
-                                    text: (modelData && modelData.title) ? modelData.title : "(untitled)"
+                                    text: {
+                                        var t = (modelData && modelData.title) ? modelData.title : "(untitled)"
+                                        var grp = root.activeMenuItem && root.activeMenuItem.isGroup === true
+                                        if (!grp || !modelData || !modelData.toplevel) return t
+                                        var an = String(modelData.toplevel.appId || "")
+                                        try {
+                                            var e = DockModel.entryFor(root.appRows, an)
+                                            if (e && root.shell && root.shell.appLibrary) an = root.shell.appLibrary.entryName(e) || an
+                                        } catch (err) {}
+                                        return an ? ("[" + an + "] " + t) : t
+                                    }
                                     font.family: Style.font.family
                                     font.pixelSize: 12
                                     elide: Text.ElideRight
                                     color: isActiveWin ? Color.accent : Color.popups.text
+                                }
+
+                                // Per-window tile ↔ float pill (hover-revealed)
+                                Rectangle {
+                                    visible: winRowArea.containsMouse
+                                    width: 16
+                                    height: 16
+                                    radius: 8
+                                    color: floatWinArea.containsMouse ? Color.accent : Style.hoverFillFor(Color.popups.text, Color.accent)
+
+                                    Text {
+                                        anchors.centerIn: parent
+                                        text: "⧉"
+                                        font.family: Style.font.family
+                                        font.pixelSize: 9
+                                        font.bold: true
+                                        color: floatWinArea.containsMouse ? Color.background : Color.popups.text
+                                    }
+
+                                    MouseArea {
+                                        id: floatWinArea
+                                        anchors.fill: parent
+                                        hoverEnabled: true
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: root.toggleWindowFloat(modelData)
+                                    }
                                 }
 
                                 // Per-window minimize ↔ restore pill (hover-revealed)
@@ -2103,17 +2431,17 @@ Item {
         color: "transparent"
 
         anchors {
-            top: root.barPosition === "bottom" ? true : (root.isVertical ? true : false)
-            bottom: root.barPosition === "top" ? true : false
-            left: root.barPosition === "right" ? true : (!root.isVertical ? true : false)
-            right: root.barPosition === "left" ? true : false
+            top: root.dockSide === "top" ? true : (root.isVertical ? true : false)
+            bottom: root.dockSide === "bottom" ? true : false
+            left: root.dockSide === "left" ? true : (!root.isVertical ? true : false)
+            right: root.dockSide === "right" ? true : false
         }
 
         margins {
-            bottom: (!root.isVertical && root.barPosition === "top") ? ((Style.gapsOut || 5) + 52) : 0
-            top: (!root.isVertical && root.barPosition === "bottom") ? ((Style.gapsOut || 5) + 52) : (root.isVertical ? root.calculatedMenuTop : 0)
-            right: (root.isVertical && root.barPosition === "left") ? ((Style.gapsOut || 5) + 52) : 0
-            left: (root.isVertical && root.barPosition === "right") ? ((Style.gapsOut || 5) + 52) : (!root.isVertical ? root.calculatedMenuLeft : 0)
+            bottom: (!root.isVertical && root.dockSide === "bottom") ? ((Style.gapsOut || 5) + 52 + root.dockEdgeNudge) : 0
+            top: (!root.isVertical && root.dockSide === "top") ? ((Style.gapsOut || 5) + 52 + root.dockEdgeNudge) : (root.isVertical ? root.calculatedMenuTop : 0)
+            right: (root.isVertical && root.dockSide === "right") ? ((Style.gapsOut || 5) + 52 + root.dockEdgeNudge) : 0
+            left: (root.isVertical && root.dockSide === "left") ? ((Style.gapsOut || 5) + 52 + root.dockEdgeNudge) : (!root.isVertical ? root.calculatedMenuLeft : 0)
         }
 
         implicitWidth: 260
@@ -2243,26 +2571,26 @@ Item {
         color: "transparent"
 
         anchors {
-            top: root.barPosition === "bottom" ? true : (root.isVertical ? true : false)
-            bottom: root.barPosition === "top" ? true : false
-            left: root.barPosition === "right" ? true : (!root.isVertical ? true : false)
-            right: root.barPosition === "left" ? true : false
+            top: root.dockSide === "top" ? true : (root.isVertical ? true : false)
+            bottom: root.dockSide === "bottom" ? true : false
+            left: root.dockSide === "left" ? true : (!root.isVertical ? true : false)
+            right: root.dockSide === "right" ? true : false
         }
 
         margins {
-            bottom: (!root.isVertical && root.barPosition === "top") ? ((Style.gapsOut || 5) + 52) : 0
-            top: (!root.isVertical && root.barPosition === "bottom") ? ((Style.gapsOut || 5) + 52) : (root.isVertical ? root.calculatedMenuTop : 0)
-            right: (root.isVertical && root.barPosition === "left") ? ((Style.gapsOut || 5) + 52) : 0
-            left: (root.isVertical && root.barPosition === "right") ? ((Style.gapsOut || 5) + 52) : (!root.isVertical ? root.calculatedMenuLeft : 0)
+            bottom: (!root.isVertical && root.dockSide === "bottom") ? ((Style.gapsOut || 5) + 52 + root.dockEdgeNudge) : 0
+            top: (!root.isVertical && root.dockSide === "top") ? ((Style.gapsOut || 5) + 52 + root.dockEdgeNudge) : (root.isVertical ? root.calculatedMenuTop : 0)
+            right: (root.isVertical && root.dockSide === "right") ? ((Style.gapsOut || 5) + 52 + root.dockEdgeNudge) : 0
+            left: (root.isVertical && root.dockSide === "left") ? ((Style.gapsOut || 5) + 52 + root.dockEdgeNudge) : (!root.isVertical ? root.calculatedMenuLeft : 0)
         }
 
         implicitWidth: 260
-        implicitHeight: 2 * 32 + 16
+        implicitHeight: 3 * 32 + 20
 
         Rectangle {
             anchors.centerIn: parent
             width: 252
-            height: 2 * 32 + 8
+            height: 1 * 32 + 12
             color: Color.composed("popups.background", "popups.background-alpha", Color.background, 0.96)
             border.width: root.systemBorderSize
             border.color: Color.accent
@@ -2275,50 +2603,9 @@ Item {
                 anchors.margins: 2
                 spacing: 2
 
-                // 👁 Toggle with Top Bar Item
-                Rectangle {
-                    Layout.fillWidth: true
-                    Layout.preferredHeight: 32
-                    radius: Math.min(6, root.systemRounding)
-                    color: tglBarMouse.containsMouse ? Style.hoverFillFor(Color.popups.text, Color.accent) : "transparent"
+                
 
-                    RowLayout {
-                        anchors.fill: parent
-                        anchors.leftMargin: 10
-                        anchors.rightMargin: 10
-                        spacing: 10
-
-                        Text {
-                            text: root.dockToggleWithBar ? "✓" : "○"
-                            font.family: Style.font.family
-                            font.pixelSize: 13
-                            font.bold: true
-                            color: root.dockToggleWithBar ? Color.accent : (tglBarMouse.containsMouse ? Color.accent : Color.popups.text)
-                        }
-
-                        Text {
-                            Layout.fillWidth: true
-                            text: "Toggle with Top Bar"
-                            font.family: Style.font.family
-                            font.pixelSize: 13
-                            color: tglBarMouse.containsMouse ? Color.accent : Color.popups.text
-                            elide: Text.ElideRight
-                        }
-                    }
-
-                    MouseArea {
-                        id: tglBarMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        cursorShape: Qt.PointingHandCursor
-                        onClicked: {
-                            root.dockSettings.toggleWithBar = !root.dockToggleWithBar
-                            root.saveSettings()
-                            root.updateDockItems()
-                            root.isDockMenuOpen = false
-                        }
-                    }
-                }
+                
 
                 // ⚙ Configure Dock Settings
                 Rectangle {
