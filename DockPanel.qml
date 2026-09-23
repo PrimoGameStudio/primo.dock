@@ -578,43 +578,73 @@ Item {
     }
 
     // Minimized window tracking (windows parked on the special:minimized workspace)
+    // shares one `hyprctl clients -j` probe with Hyprland group tracking below:
+    // a single hyprctl+jq pass emits tagged lines ("M" minimized rows, "G" group
+    // rows) instead of two full dumps every second. On non-zero exit prior
+    // state is kept and retried next tick.
     property var minimizedIds: []
     property var minimizedAddrs: ({})
     property var minimizedClassTitles: ({})
 
     Process {
-        id: minimizedProbe
+        id: clientsProbe
         property var pendingClasses: []
         property var pendingAddrs: []
         property var pendingClassTitles: []
-        command: ["bash", "-c", "hyprctl clients -j | jq -r '.[] | select(.workspace.name == \"special:minimized\") | .class + \"\\t\" + .address + \"\\t\" + (.title // \"\")'"]
+        property var pendingGroups: ({})
+        command: ["bash", "-c", "hyprctl clients -j | jq -r '.[] | ((\"G\\t\" + .address + \"\\t\" + ((.grouped // []) | join(\",\"))), (select(.workspace.name == \"special:minimized\") | (\"M\\t\" + .class + \"\\t\" + .address + \"\\t\" + (.title // \"\"))))'"]
         stdout: SplitParser {
             onRead: function(line) {
                 var value = String(line).trim()
                 if (!value || value.length === 0) return
-                // class <TAB> address <TAB> title(title may itself contain tabs -> keep the remainder)
-                var parts = value.split("\t")
-                minimizedProbe.pendingClasses.push(parts[0] || "")
-                // Normalize to bare lowercase hex so it matches snapshot meta.address values
-                var addr = String(parts[1] || "").toLowerCase().replace(/^0x/, "")
-                if (addr.length > 0) minimizedProbe.pendingAddrs.push(addr)
-                var title = parts.slice(2).join("\t")
-                minimizedProbe.pendingClassTitles.push(String(parts[0] || "") + "\u001f" + title)
+                var tag = value.slice(0, 2)
+                if (tag === "M\t") {
+                    // class <TAB> address <TAB> title (title may itself contain tabs -> keep the remainder)
+                    var mparts = value.slice(2).split("\t")
+                    clientsProbe.pendingClasses.push(mparts[0] || "")
+                    // Normalize to bare lowercase hex so it matches snapshot meta.address values
+                    var maddr = String(mparts[1] || "").toLowerCase().replace(/^0x/, "")
+                    if (maddr.length > 0) clientsProbe.pendingAddrs.push(maddr)
+                    var mtitle = mparts.slice(2).join("\t")
+                    clientsProbe.pendingClassTitles.push(String(mparts[0] || "") + String.fromCharCode(31) + mtitle)
+                } else if (tag === "G\t") {
+                    var gparts = value.slice(2).split("\t")
+                    var gaddr = String(gparts[0] || "").toLowerCase().replace(/^0x/, "")
+                    if (!gaddr) return
+                    var rawMembers = String(gparts[1] || "").toLowerCase().split(",")
+                    var members = []
+                    for (var mi = 0; mi < rawMembers.length; mi++) {
+                        var m = String(rawMembers[mi] || "").replace(/^0x/, "")
+                        if (m.length > 0 && members.indexOf(m) === -1) members.push(m)
+                    }
+                    if (members.indexOf(gaddr) === -1) members.push(gaddr)
+                    members.sort()
+                    clientsProbe.pendingGroups[gaddr] = members.join(",")
+                }
             }
         }
         onExited: function(exitCode, exitStatus) {
-            var nextClasses = minimizedProbe.pendingClasses.slice()
+            if (exitCode !== 0) {
+                clientsProbe.pendingClasses = []
+                clientsProbe.pendingAddrs = []
+                clientsProbe.pendingClassTitles = []
+                clientsProbe.pendingGroups = ({})
+                return
+            }
+            var nextClasses = clientsProbe.pendingClasses.slice()
             var nextAddrsMap = {}
-            for (var i = 0; i < minimizedProbe.pendingAddrs.length; i++) {
-                nextAddrsMap[minimizedProbe.pendingAddrs[i]] = true
+            for (var i = 0; i < clientsProbe.pendingAddrs.length; i++) {
+                nextAddrsMap[clientsProbe.pendingAddrs[i]] = true
             }
             var nextCTMap = {}
-            for (var j = 0; j < minimizedProbe.pendingClassTitles.length; j++) {
-                nextCTMap[minimizedProbe.pendingClassTitles[j]] = true
+            for (var j = 0; j < clientsProbe.pendingClassTitles.length; j++) {
+                nextCTMap[clientsProbe.pendingClassTitles[j]] = true
             }
-            minimizedProbe.pendingClasses = []
-            minimizedProbe.pendingAddrs = []
-            minimizedProbe.pendingClassTitles = []
+            var nextGroups = clientsProbe.pendingGroups
+            clientsProbe.pendingClasses = []
+            clientsProbe.pendingAddrs = []
+            clientsProbe.pendingClassTitles = []
+            clientsProbe.pendingGroups = ({})
             if (!root.arraysEqual(root.minimizedIds, nextClasses)) {
                 root.minimizedIds = nextClasses
             }
@@ -623,6 +653,9 @@ Item {
             }
             if (JSON.stringify(root.minimizedClassTitles) !== JSON.stringify(nextCTMap)) {
                 root.minimizedClassTitles = nextCTMap
+            }
+            if (JSON.stringify(root.groupMap) !== JSON.stringify(nextGroups)) {
+                root.groupMap = nextGroups
             }
         }
     }
@@ -636,10 +669,13 @@ Item {
         return true
     }
 
-    function refreshMinimized() {
-        minimizedProbe.pendingClasses = []
-        minimizedProbe.pendingAddrs = []
-        minimizedProbe.running = true
+    function refreshClients() {
+        if (clientsProbe.running) return
+        clientsProbe.pendingClasses = []
+        clientsProbe.pendingAddrs = []
+        clientsProbe.pendingClassTitles = []
+        clientsProbe.pendingGroups = ({})
+        clientsProbe.running = true
     }
 
     onMinimizedIdsChanged: updateDockItems()
@@ -648,45 +684,9 @@ Item {
 
     // Hyprland group tracking (windows joined via togglegroup).
     // Maps bare lowercase hex address -> canonical group key (sorted member
-    // addresses joined); solo windows map to their own address. Polled like
-    // the minimized probe; Quickshell exposes no group info itself.
+    // addresses joined); solo windows map to their own address. Fed by the
+    // shared clientsProbe above; Quickshell exposes no group info itself.
     property var groupMap: ({})
-
-    Process {
-        id: groupProbe
-        property var pending: ({})
-        command: ["bash", "-c", "hyprctl clients -j | jq -r '.[] | .address + \"\\t\" + ((.grouped // []) | join(\",\"))'"]
-        stdout: SplitParser {
-            onRead: function(line) {
-                var value = String(line).trim()
-                if (!value) return
-                var parts = value.split("\t")
-                var addr = String(parts[0] || "").toLowerCase().replace(/^0x/, "")
-                if (!addr) return
-                var rawMembers = String(parts[1] || "").toLowerCase().split(",")
-                var members = []
-                for (var mi = 0; mi < rawMembers.length; mi++) {
-                    var m = String(rawMembers[mi] || "").replace(/^0x/, "")
-                    if (m.length > 0 && members.indexOf(m) === -1) members.push(m)
-                }
-                if (members.indexOf(addr) === -1) members.push(addr)
-                members.sort()
-                groupProbe.pending[addr] = members.join(",")
-            }
-        }
-        onExited: function(exitCode, exitStatus) {
-            var next = groupProbe.pending
-            groupProbe.pending = ({})
-            if (JSON.stringify(root.groupMap) !== JSON.stringify(next)) {
-                root.groupMap = next
-            }
-        }
-    }
-
-    function refreshGroups() {
-        groupProbe.pending = ({})
-        if (!groupProbe.running) groupProbe.running = true
-    }
 
     onGroupMapChanged: updateDockItems()
     onDockCombineGroupsChanged: updateDockItems()
@@ -713,8 +713,7 @@ Item {
         running: true
         onTriggered: {
             barHiddenProbe.running = true
-            root.refreshMinimized()
-            root.refreshGroups()
+            root.refreshClients()
             root.refreshTitlesIfDrifted()
         }
     }
@@ -782,7 +781,11 @@ Item {
 
     Process {
         id: cavaProc
-        running: root.pluginEnabled && root.dockShowVisualizer
+        // Bound to effective dock visibility so teardown/hide SIGTERMs the
+        // wrapper (which forwards to cava, reaps it, unlinks its mkstemp
+        // config). Destruction terminates it the same way; the child also
+        // arms PDEATHSIG as a backstop against orphaned cava processes.
+        running: root.pluginEnabled && root.dockShowVisualizer && root.opened && !root.forceRemap && (!root.dockToggleWithBar || !root.barHidden)
         // Strict integer validated via safeVisualizerBars (4..64) and passed as argv data to helper — no shell interpolation
         command: ["python3", root.cavaHelper, String(root.safeVisualizerBars)]
         stdout: SplitParser {
@@ -1222,7 +1225,7 @@ Item {
             var luaFallback = 'hl.dsp.window.move({ workspace = "special:minimized", follow = false, window = "class:' + item.appId + '" })'
             Util.execDetached("hyprctl dispatch " + Util.shellQuote(luaFallback))
         }
-        root.refreshMinimized()
+        root.refreshClients()
     }
 
     // Restore a minimized app back to the current workspace and focus one of its windows
@@ -1240,7 +1243,7 @@ Item {
             + "hyprctl dispatch \"hl.dsp.window.move({ workspace = $ACTIVE, follow = true, window = \\\"address:$last\\\" })\" >/dev/null 2>&1; "
             + "fi"
         Util.execDetached("bash -c " + Util.shellQuote(script))
-        root.refreshMinimized()
+        root.refreshClients()
     }
 
     // Launch a fresh instance of an app (used by middle-click and the action card)
@@ -1333,7 +1336,7 @@ Item {
                 + "[ -n \"$ADDR\" ] && hyprctl dispatch \"hl.dsp.window.move({ workspace = \\\"special:minimized\\\", follow = false, window = \\\"address:$ADDR\\\" })\""
             Util.execDetached("bash -c " + Util.shellQuote(script))
         }
-        root.refreshMinimized()
+        root.refreshClients()
         root.activeMenuItem = null
     }
 
@@ -1353,7 +1356,7 @@ Item {
             var full = "ACTIVE=$(hyprctl activeworkspace -j | jq -r .id); " + script
             Util.execDetached("bash -c " + Util.shellQuote(full))
         }
-        root.refreshMinimized()
+        root.refreshClients()
         root.activeMenuItem = null
     }
 
@@ -1414,7 +1417,7 @@ Item {
         IconResolver.loadCustomIcons({})
         refreshLayers()
         updatePluginEnabled()
-        refreshMinimized()
+        refreshClients()
         updateDockItems()
         // Kick descriptor-validated reads for authoritative state (data via argv/stdin, not FileView source)
         if (!shellSafeRead.running) shellSafeRead.running = true
@@ -2656,6 +2659,9 @@ Item {
     PanelWindow {
         id: iconInputDialog
         property var targetItem: null
+        // Warn-but-allow validation state: non-empty means show warning,
+        // Save still persists so users are never blocked.
+        property string validationError: ""
         visible: false
 
         WlrLayershell.namespace: "omarchy-dock-dialog"
@@ -2671,9 +2677,84 @@ Item {
         anchors.right: true
         anchors.bottom: true
 
+        // Expand ~/ via HOME so the probe and preview see a real path.
+        function localPathForValue(v) {
+            var stripped = IconResolver.stripFileScheme(v)
+            if (stripped.slice(0, 2) === "~/") {
+                var home = String(Quickshell.env("HOME") || "")
+                if (home.length > 0) return home + stripped.slice(1)
+            }
+            return stripped
+        }
+
+        // Synchronous part: syntax via IconResolver + theme-name lookup.
+        // File existence is async (iconExistsProbe) and only sets a warning.
+        function revalidateIconInput() {
+            var raw = String(iconInputText.text || "")
+            var syntaxErr = IconResolver.validateCustomIconSyntax(raw)
+            if (syntaxErr) {
+                iconInputDialog.validationError = syntaxErr
+                return
+            }
+            var kind = IconResolver.classifyCustomIcon(raw)
+            if (kind === "empty") {
+                iconInputDialog.validationError = ""
+                return
+            }
+            if (kind === "file") {
+                var lp = iconInputDialog.localPathForValue(raw)
+                if (!lp || lp.charAt(0) !== "/") {
+                    iconInputDialog.validationError = "File path must be absolute or file://."
+                    return
+                }
+                // Clear any stale warning; the probe re-sets it if missing.
+                iconInputDialog.validationError = ""
+                iconExistsProbe.wantPath = lp
+                iconProbeDebounce.restart()
+                return
+            }
+            // Theme name: best-effort existence via Quickshell + appLibrary.
+            var name = raw.trim()
+            var found = false
+            try {
+                var p = Quickshell.iconPath(name, true)
+                if (p && p.length > 0 && p.indexOf("application-x-executable") === -1) found = true
+            } catch (e) {}
+            if (!found) {
+                try {
+                    var lib = (root.shell && root.shell.appLibrary) ? root.shell.appLibrary : null
+                    var q = (lib && typeof lib.iconSource === "function") ? String(lib.iconSource(name) || "") : ""
+                    if (q && q.length > 0 && q.indexOf("application-x-executable") === -1) found = true
+                } catch (e2) {}
+            }
+            iconInputDialog.validationError = found ? "" : ("Theme icon \u201C" + name + "\u201D not found \u2014 saving keeps the fallback glyph until fixed.")
+        }
+
+        function runIconProbe(path) {
+            iconExistsProbe.command = ["python3", "-c",
+                "import os, sys\n"
+                + "p = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+                + "try:\n"
+                + "    print('yes' if os.path.isfile(p) else 'no')\n"
+                + "except Exception:\n"
+                + "    print('no')\n",
+                String(path)]
+            iconExistsProbe.running = true
+        }
+
         function saveIconEntry() {
             if (iconInputDialog.targetItem && iconInputDialog.targetItem.appId) {
-                IconResolver.setCustomIcon(iconInputDialog.targetItem.appId, iconInputText.text)
+                var v = String(iconInputText.text || "").trim()
+                IconResolver.setCustomIcon(iconInputDialog.targetItem.appId, v)
+                root.saveCustomIcons()
+                root.updateDockItems()
+            }
+            iconInputDialog.visible = false
+        }
+
+        function clearIconEntry() {
+            if (iconInputDialog.targetItem && iconInputDialog.targetItem.appId) {
+                IconResolver.setCustomIcon(iconInputDialog.targetItem.appId, "")
                 root.saveCustomIcons()
                 root.updateDockItems()
             }
@@ -2685,7 +2766,60 @@ Item {
         }
 
         onVisibleChanged: {
-            if (visible) iconInputText.forceActiveFocus()
+            if (visible) {
+                iconInputDialog.validationError = ""
+                iconInputDialog.revalidateIconInput()
+                iconInputText.forceActiveFocus()
+            } else {
+                iconProbeDebounce.stop()
+            }
+        }
+
+        // Async file-existence probe (argv-passed path, no shell interpolation).
+        // Warn-but-allow: a missing file only sets validationError.
+        Process {
+            id: iconExistsProbe
+            property string wantPath: ""
+            stdout: StdioCollector {
+                waitForEnd: true
+                onStreamFinished: {
+                    var current = ""
+                    try {
+                        current = iconInputDialog.localPathForValue(iconInputText.text)
+                    } catch (e) { current = "" }
+                    if (current !== iconExistsProbe.wantPath) return
+                    if (!iconInputDialog.visible) return
+                    // Don't overwrite a harder syntax error raised meanwhile.
+                    var syntax = IconResolver.validateCustomIconSyntax(iconInputText.text)
+                    if (syntax) {
+                        iconInputDialog.validationError = syntax
+                        return
+                    }
+                    var out = String(text || "").trim()
+                    if (out !== "yes") {
+                        iconInputDialog.validationError = "File not found \u2014 saving keeps the fallback icon until fixed."
+                    } else if (iconInputDialog.validationError.indexOf("File not found") === 0
+                        || iconInputDialog.validationError.indexOf("Checking") === 0) {
+                        iconInputDialog.validationError = ""
+                    }
+                }
+            }
+        }
+
+        Timer {
+            id: iconProbeDebounce
+            interval: 250
+            repeat: false
+            onTriggered: {
+                var lp = String(iconExistsProbe.wantPath || "")
+                if (!iconInputDialog.visible || !lp) return
+                if (iconExistsProbe.running) {
+                    // Probe busy (rapid typing): retry after it settles.
+                    iconProbeDebounce.restart()
+                    return
+                }
+                iconInputDialog.runIconProbe(lp)
+            }
         }
 
         MouseArea {
@@ -2696,7 +2830,7 @@ Item {
         Rectangle {
             anchors.centerIn: parent
             width: 320
-            height: 140
+            height: 224
             color: Color.composed("popups.background", "popups.background-alpha", Color.background, 0.98)
             border.width: root.systemBorderSize
             border.color: Color.accent
@@ -2712,7 +2846,7 @@ Item {
             ColumnLayout {
                 anchors.fill: parent
                 anchors.margins: 16
-                spacing: 12
+                spacing: 10
 
                 Text {
                     Layout.fillWidth: true
@@ -2742,6 +2876,7 @@ Item {
                         selectByMouse: true
                         clip: true
                         focus: true
+                        onTextChanged: iconInputDialog.revalidateIconInput()
                         Keys.onReturnPressed: iconInputDialog.saveIconEntry()
                         Keys.onEnterPressed: iconInputDialog.saveIconEntry()
                         Keys.onEscapePressed: iconInputDialog.cancelIconEntry()
@@ -2760,9 +2895,100 @@ Item {
                     }
                 }
 
+                // Live preview + inline warning (warn-but-allow, Save stays enabled)
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+                    visible: String(iconInputText.text || "").trim().length > 0
+
+                    Image {
+                        id: iconPreview
+                        Layout.preferredWidth: 32
+                        Layout.preferredHeight: 32
+                        sourceSize.width: 64
+                        sourceSize.height: 64
+                        fillMode: Image.PreserveAspectFit
+                        smooth: true
+                        mipmap: true
+                        asynchronous: true
+                        source: {
+                            var raw = String(iconInputText.text || "").trim()
+                            if (!raw) return ""
+                            var kind = IconResolver.classifyCustomIcon(raw)
+                            if (kind === "file") {
+                                var lp = ""
+                                try { lp = iconInputDialog.localPathForValue(raw) } catch (e) { lp = "" }
+                                if (lp && lp.charAt(0) === "/") return "file://" + lp
+                                return ""
+                            }
+                            if (kind === "theme") {
+                                try {
+                                    var lib = (root.shell && root.shell.appLibrary) ? root.shell.appLibrary : null
+                                    var q = (lib && typeof lib.iconSource === "function") ? String(lib.iconSource(raw.trim()) || "") : ""
+                                    if (q && q.length > 0 && q.indexOf("application-x-executable") === -1) return q
+                                } catch (e) {}
+                                try {
+                                    var p = Quickshell.iconPath(raw.trim(), true)
+                                    if (p && p.length > 0) return p
+                                } catch (e2) {}
+                            }
+                            return ""
+                        }
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        Layout.alignment: Qt.AlignVCenter
+                        visible: iconInputDialog.validationError !== ""
+                        text: iconInputDialog.validationError
+                        font.family: Style.font.family
+                        font.pixelSize: 12
+                        color: Color.accent
+                        wrapMode: Text.Wrap
+                        elide: Text.ElideRight
+                        maximumLineCount: 2
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        Layout.alignment: Qt.AlignVCenter
+                        visible: iconInputDialog.validationError === "" && iconPreview.status === Image.Ready
+                        text: "Looks good \u2014 Save applies it to the dock."
+                        font.family: Style.font.family
+                        font.pixelSize: 12
+                        color: Color.muted
+                        elide: Text.ElideRight
+                    }
+                }
+
                 RowLayout {
                     Layout.alignment: Qt.AlignRight
                     spacing: 8
+
+                    Rectangle {
+                        width: 70
+                        height: 28
+                        radius: 6
+                        color: clearMouse.containsMouse ? Style.hoverFillFor(Color.popups.text, Color.accent) : "transparent"
+                        border.width: 1
+                        border.color: Color.muted
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "Clear"
+                            font.family: Style.font.family
+                            font.pixelSize: 12
+                            color: Color.popups.text
+                        }
+
+                        MouseArea {
+                            id: clearMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: iconInputDialog.clearIconEntry()
+                        }
+                    }
 
                     Rectangle {
                         width: 70

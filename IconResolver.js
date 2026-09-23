@@ -47,6 +47,52 @@ function loadCustomIcons(map) {
     iconCache = {};
 }
 
+// Validation for user-supplied custom icon overrides (iconInputDialog).
+// Pure string checks only — .pragma library code cannot do async I/O, so
+// file existence is probed QML-side; theme-name existence is best-effort
+// via Quickshell.iconPath() in the dialog.
+var MAX_CUSTOM_ICON_LENGTH = 1024;
+
+function stripFileScheme(raw) {
+    var s = stripIconParams(String(raw || "").trim());
+    if (s.slice(0, 7).toLowerCase() === "file://") s = s.slice(7);
+    return s;
+}
+
+// "empty" (clears override), "file" (absolute/file:// or contains a slash),
+// "theme" (bare icon name), or "invalid" (fails basic syntax).
+function classifyCustomIcon(raw) {
+    var s = String(raw == null ? "" : raw).trim();
+    if (!s) return "empty";
+    if (s.length > MAX_CUSTOM_ICON_LENGTH) return "invalid";
+    if (s.indexOf("\u0000") !== -1) return "invalid";
+    if (s.indexOf("\n") !== -1 || s.indexOf("\r") !== -1) return "invalid";
+    var low = s.toLowerCase();
+    if (low.indexOf("file://") === 0 || s.charAt(0) === "/" || s.slice(0, 2) === "~/") return "file";
+    if (s.indexOf("/") !== -1) return "file";
+    if (/^[A-Za-z0-9._+\-]+$/.test(s)) return "theme";
+    return "invalid";
+}
+
+// Synchronous syntax check. Returns "" when plausible, else a short
+// user-facing reason. File existence is NOT checked here (async probe in
+// QML); unknown theme names are allowed through with a warning there.
+function validateCustomIconSyntax(raw) {
+    var s = String(raw == null ? "" : raw).trim();
+    if (!s) return "";
+    if (s.indexOf("\u0000") !== -1) return "Icon path contains an invalid character.";
+    if (s.length > MAX_CUSTOM_ICON_LENGTH) return "Icon value is too long (max " + MAX_CUSTOM_ICON_LENGTH + " characters).";
+    if (s.indexOf("\n") !== -1 || s.indexOf("\r") !== -1) return "Icon value must be a single line.";
+    var kind = classifyCustomIcon(s);
+    if (kind === "file") {
+        var local = stripFileScheme(s);
+        if (!local) return "File path is empty.";
+        return "";
+    }
+    if (kind === "theme") return "";
+    return "Use a theme icon name (letters, digits, . _ + -) or an absolute/file:// path.";
+}
+
 var FALLBACK_MAP = {
     "kitty": "kitty",
     "alacritty": "Alacritty",

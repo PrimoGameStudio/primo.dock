@@ -4,14 +4,14 @@
 Usage: cava-gen.py <bars>
 - bars must match /^[0-9]+$/ and 4 <= int(bars) <= 64
 - Writes 0600 config to $XDG_RUNTIME_DIR/cava.XXXXXX (umask 077)
-- Execs cava -p <config> (replaces process, EXIT trap cleans up via parent wrapper).
-  If called directly, this script does the mkstemp+exec.
-
-The QML side should pass validatedVisualizerBars as argv[1] (data, not shell source).
+- Forks cava -p <config>; parent forwards SIGTERM/SIGINT/SIGHUP/SIGQUIT
+  to cava, reaps it, then unlinks the config. Child arms PDEATHSIG so a
+  killed parent still takes cava down (no orphan on dock terminate).
 """
 import os
 import sys
 import re
+import signal
 import tempfile
 import stat
 
@@ -79,30 +79,95 @@ def main():
     if not path:
         sys.exit(1)
 
-    # Cleanup on exit: register atexit via shell wrapper would be needed after exec.
-    # Since we exec cava, we need to ensure cleanup after cava exits. Use try/finally around exec
-    # by forking: parent waits and removes file. Simpler: exec via os.execvp and rely on
-    # outer shell trap - but we are the wrapper, so fork.
+    # Cleanup on exit: parent waits for cava, forwards termination signals
+    # so no orphan survives dock teardown, then removes the mkstemp config.
+    # The child sets PDEATHSIG so even a SIGKILLed parent still takes cava
+    # down with it (kernel sends SIGTERM to cava on reparent).
+    child_pid = None
+    term_sig = None
+    term_count = 0
+
+    def _set_pdeathsig():
+        try:
+            import ctypes
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            PR_SET_PDEATHSIG = 1
+            libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+        except Exception:
+            pass
+
     pid = os.fork()
     if pid == 0:
-        # Child: exec cava
+        # Child: restore default dispositions (parent installs forwarders
+        # below), arm death-signal, abort if already orphaned, then exec.
+        for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
+            try:
+                signal.signal(_sig, signal.SIG_DFL)
+            except Exception:
+                pass
+        _set_pdeathsig()
+        try:
+            if os.getppid() == 1:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                os._exit(127)
+        except Exception:
+            pass
         try:
             os.execvp("cava", ["cava", "-p", path])
         except OSError as e:
             eprint(f"exec cava failed: {e}")
             sys.exit(127)
     else:
-        # Parent: wait for cava, then remove config
-        _, status = os.waitpid(pid, 0)
+        child_pid = pid
+
+        def _forward(signum, _frame):
+            nonlocal term_sig, term_count
+            if term_sig is None:
+                term_sig = signum
+            term_count += 1
+            # First attempt: graceful SIGTERM; repeated signal: escalate.
+            _sig = signal.SIGTERM if term_count == 1 else signal.SIGKILL
+            try:
+                if child_pid is not None:
+                    os.kill(child_pid, _sig)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            # Do not exit here: fall through to waitpid so the child is
+            # reaped (no zombie) and the config is unlinked.
+
+        for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
+            try:
+                signal.signal(_sig, _forward)
+            except Exception:
+                pass
+        status = None
+        while True:
+            try:
+                _, status = os.waitpid(child_pid, 0)
+                break
+            except InterruptedError:
+                continue
+            except ChildProcessError:
+                break
+        child_pid = None
         try:
             os.unlink(path)
         except OSError:
             pass
+        # Terminated by dock teardown: report 128+sig like a shell.
+        if term_sig is not None and status is not None and os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0:
+            sys.exit(128 + term_sig)
+        if term_sig is not None and status is None:
+            sys.exit(128 + term_sig)
         # Propagate cava exit code
-        if os.WIFEXITED(status):
-            sys.exit(os.WEXITSTATUS(status))
-        elif os.WIFSIGNALED(status):
-            sys.exit(128 + os.WTERMSIG(status))
+        if status is not None:
+            if os.WIFEXITED(status):
+                sys.exit(os.WEXITSTATUS(status))
+            elif os.WIFSIGNALED(status):
+                sys.exit(128 + os.WTERMSIG(status))
         sys.exit(1)
 
 if __name__ == "__main__":
