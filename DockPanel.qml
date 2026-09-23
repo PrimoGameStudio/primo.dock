@@ -41,7 +41,12 @@ Item {
     readonly property int safeVisualizerBars: validatedVisualizerBars()
     readonly property string pluginDir: Quickshell.env("HOME") + "/.config/omarchy/plugins/primo.dock"
     readonly property string safeReadHelper: pluginDir + "/helpers/safeRead.py"
+    readonly property string settingsWriterHelper: pluginDir + "/helpers/settingsWriter.py"
+    readonly property string dockLogHelper: pluginDir + "/helpers/dockLog.py"
     readonly property string cavaHelper: pluginDir + "/helpers/cava-gen.py"
+    readonly property string debugLogPath: Quickshell.env("HOME") + "/.local/state/omarchy/primo.dock/debug.log"
+    // Strict opt-in: debug logging defaults OFF (unlike the !== false features above)
+    readonly property bool dockDebugLogging: dockSettings.debugLogging === true
 
     // Dock state & Multi-source Live Bar Position Tracking
     property bool opened: true
@@ -108,6 +113,39 @@ Item {
         function close() { root.close(); return "ok" }
         function toggle() { root.toggle(); return "ok" }
         function refresh() { return root.refresh() }
+        function debug(state) { return root.setDebugLogging(state) }
+    }
+
+    // Debug logging: file append via dockLog.py when dockDebugLogging is on.
+    // Fire-and-forget with drop-when-busy (debug events are rare lifecycle
+    // points, never hot paths) — mirrors the refreshClients() guard.
+    Process {
+        id: logProc
+    }
+
+    function dbg(tag, msg) {
+        if (!root.dockDebugLogging) return
+        if (logProc.running) return
+        logProc.command = ["python3", root.dockLogHelper, root.debugLogPath, String(tag), String(msg)]
+        logProc.running = true
+    }
+
+    // Toggle debug logging now + persist to settings (IPC: debug on/off/toggle)
+    function setDebugLogging(state) {
+        var want = root.dockDebugLogging
+        var arg = String(state == null ? "" : state).toLowerCase().trim()
+        if (arg === "on" || arg === "1" || arg === "true") want = true
+        else if (arg === "off" || arg === "0" || arg === "false") want = false
+        else want = !want
+        var next = JSON.parse(JSON.stringify(root.dockSettings))
+        next.debugLogging = want
+        root.dockSettings = next
+        root.saveSettings()
+        // Log via console either way (the file writer only runs when enabled,
+        // and this call may have just disabled it)
+        console.log("primo.dock: debug logging " + (want ? "on (" + root.debugLogPath + ")" : "off"))
+        if (want) root.dbg("debug", "logging enabled")
+        return want ? "ok on" : "ok off"
     }
 
     // Methods called by shell.summon / shell.hide / shell.toggle
@@ -160,6 +198,18 @@ Item {
         onTriggered: {
             if (!shellSafeRead.running) shellSafeRead.running = true
         }
+    }
+
+    // Coalesce rapid toplevel/workspace/monitor/library bursts into one rebuild
+    Timer {
+        id: dockItemsDebounce
+        interval: 120
+        repeat: false
+        onTriggered: root.updateDockItems()
+    }
+
+    function requestDockItemsUpdate() {
+        dockItemsDebounce.restart()
     }
 
     Timer {
@@ -369,6 +419,61 @@ Item {
         }
     }
 
+    // Shared polling budgets for the detached float scripts below. The outer
+    // appearance watch waits for app-launch latency (seconds are legitimate);
+    // the confirm loops wait for compositor state-flip ack (ms when fast, so
+    // a ~2s budget keeps loaded systems covered). Fast paths break on first
+    // success, so the larger budget adds no success-path latency.
+    readonly property int floatWatchTries: 60
+    readonly property real floatWatchSleep: 0.1
+    readonly property int floatConfirmTries: 20
+    readonly property real floatConfirmSleep: 0.1
+
+    // Common env prefix for the float scripts: gated debug self-report on
+    // timeout via dockLog.py (DBG=1 only when debug logging is on).
+    function floatScriptEnv() {
+        return "DBG=" + (root.dockDebugLogging ? "1" : "0") + "; LOG=" + Util.shellQuote(root.debugLogPath) + "; HELPER=" + Util.shellQuote(root.dockLogHelper) + "; "
+    }
+    // Gated timeout report; label may reference bash vars ($ADDR/$CLS) which
+    // expand inside the double quotes. Ends with exit 1 (execDetached ignores
+    // it today, but it is honest and future-proof).
+    function floatTimeoutReport(label) {
+        return "[ \"$DBG\" = \"1\" ] && python3 \"$HELPER\" \"$LOG\" float \"" + label + "\" 2>/dev/null; exit 1"
+    }
+    // Shared float-state confirm poll. Mode "true" waits for floating==true
+    // (fresh launches, resize); mode "flip" waits for any change from the
+    // BEFORE_FLOAT baseline (toggle either direction).
+    function floatConfirmSnippet(mode) {
+        var cond = (mode === "flip") ? "[ \"$FLOAT\" != \"$BEFORE_FLOAT\" ]" : "[ \"$FLOAT\" = \"true\" ]"
+        return "for _ in $(seq 1 " + root.floatConfirmTries + "); do FLOAT=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .floating'); if " + cond + "; then break; fi; sleep " + root.floatConfirmSleep + "; done; "
+    }
+    // Shared env prefix for the float scripts: resize ratios, dock-edge
+    // clearance offsets, and the dock-screen gate. Expects callers to have
+    // already set their identity var (CLS= or ADDR=) before/after this.
+    function floatEnvPrefix(ratioX, ratioY) {
+        return "RATIO_X=" + Util.shellQuote(String(ratioX)) + "; RATIO_Y=" + Util.shellQuote(String(ratioY)) + "; OFF_X=" + Util.shellQuote(String(root.dockFloatOffsetX)) + "; OFF_Y=" + Util.shellQuote(String(root.dockFloatOffsetY)) + "; PRIMARY_MON=" + Util.shellQuote(root.dockScreenName) + "; OFFSET_ONLY=" + (root.dockFloatOffsetPrimaryOnly ? "1" : "0") + "; "
+    }
+    // Shared monitor-geometry + center/resize fragment. Operates on $ADDR
+    // (already confirmed floating by the caller) with $RATIO_X/$RATIO_Y and
+    // the offset vars from floatEnvPrefix. Resolves the window's monitor,
+    // falls back to the focused monitor, defaults SCALE to 1, exits 0 when
+    // geometry is unavailable (Option A), then resizes to the configured
+    // ratios and centers on the monitor (global layout coordinates).
+    function floatCenterOnMonitorSnippet() {
+        return "MON=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .monitor'); "
+            + "MON_NAME=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .name'); "
+            + "if [ \"$OFFSET_ONLY\" = \"1\" ] && [ -n \"$MON_NAME\" ] && [ -n \"$PRIMARY_MON\" ] && [ \"$MON_NAME\" != \"$PRIMARY_MON\" ]; then OX=0; OY=0; else OX=$OFF_X; OY=$OFF_Y; fi; "
+            + "MW=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .width'); MH=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .height'); MX=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .x'); MY=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .y'); SCALE=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .scale'); "
+            + "if [ -z \"$MW\" ] || [ \"$MW\" = \"null\" ] || [ -z \"$MH\" ] || [ \"$MH\" = \"null\" ]; then MW=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .width'); MH=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .height'); MX=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .x'); MY=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .y'); SCALE=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .scale'); fi; "
+            + "if [ -z \"$SCALE\" ] || [ \"$SCALE\" = \"null\" ]; then SCALE=1; fi; "
+            + "if [ -z \"$MW\" ] || [ -z \"$MH\" ] || [ \"$MW\" = \"null\" ] || [ \"$MH\" = \"null\" ]; then exit 0; fi; "
+            + "NW=$(awk -v mw=\"$MW\" -v s=\"$SCALE\" -v r=\"$RATIO_X\" 'BEGIN{printf \"%d\", mw/s*r}'); NH=$(awk -v mh=\"$MH\" -v s=\"$SCALE\" -v r=\"$RATIO_Y\" 'BEGIN{printf \"%d\", mh/s*r}'); MWL=$(awk -v mw=\"$MW\" -v s=\"$SCALE\" 'BEGIN{printf \"%d\", mw/s}'); MHL=$(awk -v mh=\"$MH\" -v s=\"$SCALE\" 'BEGIN{printf \"%d\", mh/s}'); "
+            + "NX=$((MX + (MWL - NW)/2 + OX)); NY=$((MY + (MHL - NH)/2 + OY)); "
+            + "hyprctl dispatch \"hl.dsp.window.resize({ window = \\\"address:$ADDR\\\", x = $NW, y = $NH })\" 2>/dev/null; "
+            + "sleep 0.05; "
+            + "hyprctl dispatch \"hl.dsp.window.move({ window = \\\"address:$ADDR\\\", x = $NX, y = $NY })\" 2>/dev/null; "
+    }
+
     // Watch (≤6s) for the next NEW client of classHint and float + resize it.
     // Must be started BEFORE dispatching the launch so pre-existing windows
     // land in the baseline snapshot. Fresh Hyprland windows are tiled, so a
@@ -381,30 +486,19 @@ Item {
         if (!cls) return
         var ratioX = root.dockFloatingWindowScaleX
         var ratioY = root.dockFloatingWindowScaleY
-        var script = "CLS=" + Util.shellQuote(cls) + "; RATIO_X=" + Util.shellQuote(String(ratioX)) + "; RATIO_Y=" + Util.shellQuote(String(ratioY)) + "; OFF_X=" + Util.shellQuote(String(root.dockFloatOffsetX)) + "; OFF_Y=" + Util.shellQuote(String(root.dockFloatOffsetY)) + "; PRIMARY_MON=" + Util.shellQuote(root.dockScreenName) + "; OFFSET_ONLY=" + (root.dockFloatOffsetPrimaryOnly ? "1" : "0") + "; "
+        var script = root.floatScriptEnv() + "CLS=" + Util.shellQuote(cls) + "; " + root.floatEnvPrefix(ratioX, ratioY)
             + "BEFORE=$(hyprctl clients -j | jq -r '.[].address' | sort); "
-            + "for i in $(seq 1 60); do "
+            + "for i in $(seq 1 " + root.floatWatchTries + "); do "
             + "ADDR=$(hyprctl clients -j | jq -r --arg c \"$CLS\" '.[] | select(.class == $c) | .address' | sort | comm -13 <(printf '%s\\n' \"$BEFORE\") - | head -n1); "
             + "if [ -n \"$ADDR\" ]; then "
             + "hyprctl dispatch \"hl.dsp.window.float({ window = \\\"address:$ADDR\\\", action = \\\"toggle\\\" })\" 2>/dev/null; RC=$?; "
             + "[ $RC -ne 0 ] && { hyprctl dispatch \"togglefloating address:$ADDR\" 2>/dev/null; RC=$?; [ $RC -ne 0 ] && hyprctl dispatch \"togglefloating $ADDR\" 2>/dev/null; }; "
-            + "for _ in 1 2 3 4 5; do FLOAT=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .floating'); if [ \"$FLOAT\" = \"true\" ]; then break; fi; sleep 0.1; done; "
-            + "if [ \"$FLOAT\" != \"true\" ]; then exit 0; fi; "
-            + "MON=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .monitor'); "
-            + "MON_NAME=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .name'); "
-            + "if [ \"$OFFSET_ONLY\" = \"1\" ] && [ -n \"$MON_NAME\" ] && [ -n \"$PRIMARY_MON\" ] && [ \"$MON_NAME\" != \"$PRIMARY_MON\" ]; then OX=0; OY=0; else OX=$OFF_X; OY=$OFF_Y; fi; "
-            + "MW=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .width'); MH=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .height'); MX=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .x'); MY=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .y'); SCALE=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .scale'); "
-            + "if [ -z \"$MW\" ] || [ \"$MW\" = \"null\" ] || [ -z \"$MH\" ] || [ \"$MH\" = \"null\" ]; then MW=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .width'); MH=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .height'); MX=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .x'); MY=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .y'); SCALE=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .scale'); fi; "
-            + "if [ -z \"$SCALE\" ] || [ \"$SCALE\" = \"null\" ]; then SCALE=1; fi; "
-            + "if [ -n \"$MW\" ] && [ -n \"$MH\" ] && [ \"$MW\" != \"null\" ] && [ \"$MH\" != \"null\" ]; then "
-            + "NW=$(awk -v mw=\"$MW\" -v s=\"$SCALE\" -v r=\"$RATIO_X\" 'BEGIN{printf \"%d\", mw/s*r}'); NH=$(awk -v mh=\"$MH\" -v s=\"$SCALE\" -v r=\"$RATIO_Y\" 'BEGIN{printf \"%d\", mh/s*r}'); MWL=$(awk -v mw=\"$MW\" -v s=\"$SCALE\" 'BEGIN{printf \"%d\", mw/s}'); MHL=$(awk -v mh=\"$MH\" -v s=\"$SCALE\" 'BEGIN{printf \"%d\", mh/s}'); "
-            + "NX=$((MX + (MWL - NW)/2 + OX)); NY=$((MY + (MHL - NH)/2 + OY)); "
-            + "hyprctl dispatch \"hl.dsp.window.resize({ window = \\\"address:$ADDR\\\", x = $NW, y = $NH })\" 2>/dev/null; "
-            + "sleep 0.05; "
-            + "hyprctl dispatch \"hl.dsp.window.move({ window = \\\"address:$ADDR\\\", x = $NX, y = $NY })\" 2>/dev/null; "
-            + "fi; "
+            + root.floatConfirmSnippet("true")
+            + "if [ \"$FLOAT\" != \"true\" ]; then " + root.floatTimeoutReport("float confirm timed out for $ADDR (class $CLS)") + "; fi; "
+            + root.floatCenterOnMonitorSnippet()
             + "exit 0; fi; "
-            + "sleep 0.1; done"
+            + "sleep " + root.floatWatchSleep + "; done; "
+            + root.floatTimeoutReport("appearance watch timed out for class $CLS")
         Util.execDetached("bash -c " + Util.shellQuote(script))
     }
 
@@ -416,21 +510,10 @@ Item {
         if (!a) return
         var ratioX = root.dockFloatingWindowScaleX
         var ratioY = root.dockFloatingWindowScaleY
-        var script = "ADDR=" + Util.shellQuote(a) + "; RATIO_X=" + Util.shellQuote(String(ratioX)) + "; RATIO_Y=" + Util.shellQuote(String(ratioY)) + "; OFF_X=" + Util.shellQuote(String(root.dockFloatOffsetX)) + "; OFF_Y=" + Util.shellQuote(String(root.dockFloatOffsetY)) + "; PRIMARY_MON=" + Util.shellQuote(root.dockScreenName) + "; OFFSET_ONLY=" + (root.dockFloatOffsetPrimaryOnly ? "1" : "0") + "; "
-            + "for _ in 1 2 3 4 5; do FLOAT=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .floating'); if [ \"$FLOAT\" = \"true\" ]; then break; fi; sleep 0.1; done; "
-            + "if [ \"$FLOAT\" != \"true\" ]; then exit 0; fi; "
-            + "MON=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .monitor'); "
-            + "MON_NAME=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .name'); "
-            + "if [ \"$OFFSET_ONLY\" = \"1\" ] && [ -n \"$MON_NAME\" ] && [ -n \"$PRIMARY_MON\" ] && [ \"$MON_NAME\" != \"$PRIMARY_MON\" ]; then OX=0; OY=0; else OX=$OFF_X; OY=$OFF_Y; fi; "
-            + "MW=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .width'); MH=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .height'); MX=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .x'); MY=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .y'); SCALE=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .scale'); "
-            + "if [ -z \"$MW\" ] || [ \"$MW\" = \"null\" ] || [ -z \"$MH\" ] || [ \"$MH\" = \"null\" ]; then MW=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .width'); MH=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .height'); MX=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .x'); MY=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .y'); SCALE=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .scale'); fi; "
-            + "if [ -z \"$SCALE\" ] || [ \"$SCALE\" = \"null\" ]; then SCALE=1; fi; "
-            + "if [ -z \"$MW\" ] || [ -z \"$MH\" ] || [ \"$MW\" = \"null\" ] || [ \"$MH\" = \"null\" ]; then exit 0; fi; "
-            + "NW=$(awk -v mw=\"$MW\" -v s=\"$SCALE\" -v r=\"$RATIO_X\" 'BEGIN{printf \"%d\", mw/s*r}'); NH=$(awk -v mh=\"$MH\" -v s=\"$SCALE\" -v r=\"$RATIO_Y\" 'BEGIN{printf \"%d\", mh/s*r}'); MWL=$(awk -v mw=\"$MW\" -v s=\"$SCALE\" 'BEGIN{printf \"%d\", mw/s}'); MHL=$(awk -v mh=\"$MH\" -v s=\"$SCALE\" 'BEGIN{printf \"%d\", mh/s}'); "
-            + "NX=$((MX + (MWL - NW)/2 + OX)); NY=$((MY + (MHL - NH)/2 + OY)); "
-            + "hyprctl dispatch \"hl.dsp.window.resize({ window = \\\"address:$ADDR\\\", x = $NW, y = $NH })\" 2>/dev/null; "
-            + "sleep 0.05; "
-            + "hyprctl dispatch \"hl.dsp.window.move({ window = \\\"address:$ADDR\\\", x = $NX, y = $NY })\" 2>/dev/null; "
+        var script = root.floatScriptEnv() + "ADDR=" + Util.shellQuote(a) + "; " + root.floatEnvPrefix(ratioX, ratioY)
+            + root.floatConfirmSnippet("true")
+            + "if [ \"$FLOAT\" != \"true\" ]; then " + root.floatTimeoutReport("float confirm timed out for $ADDR (resize)") + "; fi; "
+            + root.floatCenterOnMonitorSnippet()
         Util.execDetached("bash -c " + Util.shellQuote(script))
     }
 
@@ -442,24 +525,14 @@ Item {
         if (!a) return
         var ratioX = root.dockFloatingWindowScaleX
         var ratioY = root.dockFloatingWindowScaleY
-        var script = "ADDR=" + Util.shellQuote(a) + "; RATIO_X=" + Util.shellQuote(String(ratioX)) + "; RATIO_Y=" + Util.shellQuote(String(ratioY)) + "; OFF_X=" + Util.shellQuote(String(root.dockFloatOffsetX)) + "; OFF_Y=" + Util.shellQuote(String(root.dockFloatOffsetY)) + "; PRIMARY_MON=" + Util.shellQuote(root.dockScreenName) + "; OFFSET_ONLY=" + (root.dockFloatOffsetPrimaryOnly ? "1" : "0") + "; "
+        var script = root.floatScriptEnv() + "ADDR=" + Util.shellQuote(a) + "; " + root.floatEnvPrefix(ratioX, ratioY)
             + "BEFORE_FLOAT=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .floating'); "
             + "hyprctl dispatch \"hl.dsp.window.float({ window = \\\"address:$ADDR\\\", action = \\\"toggle\\\" })\" 2>/dev/null; RC=$?; "
             + "[ $RC -ne 0 ] && { hyprctl dispatch \"togglefloating address:$ADDR\" 2>/dev/null; RC=$?; [ $RC -ne 0 ] && hyprctl dispatch \"togglefloating $ADDR\" 2>/dev/null; }; "
-            + "for _ in 1 2 3 4 5 6; do FLOAT=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .floating'); if [ \"$FLOAT\" != \"$BEFORE_FLOAT\" ]; then break; fi; sleep 0.08; done; "
+            + root.floatConfirmSnippet("flip")
+            + "if [ \"$FLOAT\" = \"$BEFORE_FLOAT\" ]; then " + root.floatTimeoutReport("float flip timed out for $ADDR") + "; fi; "
             + "if [ \"$FLOAT\" != \"true\" ]; then exit 0; fi; "
-            + "MON=$(hyprctl clients -j | jq -r --arg a \"$ADDR\" '.[] | select(.address==$a) | .monitor'); "
-            + "MON_NAME=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .name'); "
-            + "if [ \"$OFFSET_ONLY\" = \"1\" ] && [ -n \"$MON_NAME\" ] && [ -n \"$PRIMARY_MON\" ] && [ \"$MON_NAME\" != \"$PRIMARY_MON\" ]; then OX=0; OY=0; else OX=$OFF_X; OY=$OFF_Y; fi; "
-            + "MW=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .width'); MH=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .height'); MX=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .x'); MY=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .y'); SCALE=$(hyprctl monitors -j | jq -r --arg m \"$MON\" '.[] | select(.id==($m|tonumber)) | .scale'); "
-            + "if [ -z \"$MW\" ] || [ \"$MW\" = \"null\" ] || [ -z \"$MH\" ] || [ \"$MH\" = \"null\" ]; then MW=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .width'); MH=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .height'); MX=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .x'); MY=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .y'); SCALE=$(hyprctl monitors -j | jq -r '.[] | select(.focused==true) | .scale'); fi; "
-            + "if [ -z \"$SCALE\" ] || [ \"$SCALE\" = \"null\" ]; then SCALE=1; fi; "
-            + "if [ -z \"$MW\" ] || [ -z \"$MH\" ] || [ \"$MW\" = \"null\" ] || [ \"$MH\" = \"null\" ]; then exit 0; fi; "
-            + "NW=$(awk -v mw=\"$MW\" -v s=\"$SCALE\" -v r=\"$RATIO_X\" 'BEGIN{printf \"%d\", mw/s*r}'); NH=$(awk -v mh=\"$MH\" -v s=\"$SCALE\" -v r=\"$RATIO_Y\" 'BEGIN{printf \"%d\", mh/s*r}'); MWL=$(awk -v mw=\"$MW\" -v s=\"$SCALE\" 'BEGIN{printf \"%d\", mw/s}'); MHL=$(awk -v mh=\"$MH\" -v s=\"$SCALE\" 'BEGIN{printf \"%d\", mh/s}'); "
-            + "NX=$((MX + (MWL - NW)/2 + OX)); NY=$((MY + (MHL - NH)/2 + OY)); "
-            + "hyprctl dispatch \"hl.dsp.window.resize({ window = \\\"address:$ADDR\\\", x = $NW, y = $NH })\" 2>/dev/null; "
-            + "sleep 0.05; "
-            + "hyprctl dispatch \"hl.dsp.window.move({ window = \\\"address:$ADDR\\\", x = $NX, y = $NY })\" 2>/dev/null; "
+            + root.floatCenterOnMonitorSnippet()
         Util.execDetached("bash -c " + Util.shellQuote(script))
     }
 
@@ -592,6 +665,11 @@ Item {
         property var pendingAddrs: []
         property var pendingClassTitles: []
         property var pendingGroups: ({})
+        // Consecutive-failure tracking: a missing jq (exit 127) or a dead
+        // compositor socket fails silently per-tick, so count up and degrade
+        // to a slow retry instead of respawning a doomed pipeline every second.
+        property int failCount: 0
+        property bool degraded: false
         command: ["bash", "-c", "hyprctl clients -j | jq -r '.[] | ((\"G\\t\" + .address + \"\\t\" + ((.grouped // []) | join(\",\"))), (select(.workspace.name == \"special:minimized\") | (\"M\\t\" + .class + \"\\t\" + .address + \"\\t\" + (.title // \"\"))))'"]
         stdout: SplitParser {
             onRead: function(line) {
@@ -629,7 +707,20 @@ Item {
                 clientsProbe.pendingAddrs = []
                 clientsProbe.pendingClassTitles = []
                 clientsProbe.pendingGroups = ({})
+                clientsProbe.failCount++
+                if (clientsProbe.failCount >= 5 && !clientsProbe.degraded) {
+                    clientsProbe.degraded = true
+                    var failMsg = "clientsProbe failing (exit " + exitCode + ", x" + clientsProbe.failCount + ") — minimized/group tracking paused, retrying slowly; check that hyprctl and jq are installed"
+                    console.warn("primo.dock: " + failMsg)
+                    root.dbg("probe", failMsg)
+                }
                 return
+            }
+            clientsProbe.failCount = 0
+            if (clientsProbe.degraded) {
+                clientsProbe.degraded = false
+                console.log("primo.dock: clientsProbe recovered")
+                root.dbg("probe", "clientsProbe recovered")
             }
             var nextClasses = clientsProbe.pendingClasses.slice()
             var nextAddrsMap = {}
@@ -678,9 +769,9 @@ Item {
         clientsProbe.running = true
     }
 
-    onMinimizedIdsChanged: updateDockItems()
-    onMinimizedAddrsChanged: updateDockItems()
-    onMinimizedClassTitlesChanged: updateDockItems()
+    onMinimizedIdsChanged: requestDockItemsUpdate()
+    onMinimizedAddrsChanged: requestDockItemsUpdate()
+    onMinimizedClassTitlesChanged: requestDockItemsUpdate()
 
     // Hyprland group tracking (windows joined via togglegroup).
     // Maps bare lowercase hex address -> canonical group key (sorted member
@@ -688,8 +779,8 @@ Item {
     // shared clientsProbe above; Quickshell exposes no group info itself.
     property var groupMap: ({})
 
-    onGroupMapChanged: updateDockItems()
-    onDockCombineGroupsChanged: updateDockItems()
+    onGroupMapChanged: requestDockItemsUpdate()
+    onDockCombineGroupsChanged: requestDockItemsUpdate()
 
     // All persistent state lives in primo.dock-settings.json (single file, reads via Process+safeRead.py/StdioCollector, writes via atomic settingsWriter)
     property var pinnedIds: []
@@ -711,9 +802,13 @@ Item {
         interval: 1000
         repeat: true
         running: true
+        property int probeTick: 0
         onTriggered: {
             barHiddenProbe.running = true
-            root.refreshClients()
+            // While the clients probe is degraded, retry it only every ~10s
+            // instead of respawning a failing pipeline each tick.
+            probeTick++
+            if (!clientsProbe.degraded || probeTick % 10 === 0) root.refreshClients()
             root.refreshTitlesIfDrifted()
         }
     }
@@ -905,7 +1000,7 @@ Item {
     function refreshTitlesIfDrifted() {
         if (!root.toplevelInfos || root.toplevelInfos.length === 0) return
         if (!root.toplevelInfosMatch(computeToplevelInfos(), root.toplevelInfos)) {
-            root.updateDockItems()
+            root.requestDockItemsUpdate()
         }
     }
 
@@ -969,28 +1064,28 @@ Item {
         }
     }
 
-    onPinnedIdsChanged: updateDockItems()
-    onBlacklistIdsChanged: updateDockItems()
-    onAppRowsChanged: updateDockItems()
+    onPinnedIdsChanged: requestDockItemsUpdate()
+    onBlacklistIdsChanged: requestDockItemsUpdate()
+    onAppRowsChanged: requestDockItemsUpdate()
     onShellChanged: {
         root.appRows = (shell && shell.appLibrary) ? shell.appLibrary.sortedEntries("") : []
-        root.updateDockItems()
+        root.requestDockItemsUpdate()
     }
 
     Connections {
         target: ToplevelManager.toplevels
-        function onValuesChanged() { root.updateDockItems() }
+        function onValuesChanged() { root.requestDockItemsUpdate() }
     }
 
     Connections {
         target: ToplevelManager
-        function onActiveToplevelChanged() { root.updateDockItems() }
+        function onActiveToplevelChanged() { root.requestDockItemsUpdate() }
     }
 
     Connections {
         target: Hyprland
-        function onFocusedWorkspaceChanged() { root.updateDockItems() }
-        function onFocusedMonitorChanged() { root.updateDockItems() }
+        function onFocusedWorkspaceChanged() { root.requestDockItemsUpdate() }
+        function onFocusedMonitorChanged() { root.requestDockItemsUpdate() }
     }
 
     Connections {
@@ -998,8 +1093,28 @@ Item {
         enabled: target !== null
         function onAppsChanged() {
             root.appRows = shell.appLibrary.sortedEntries("")
-            root.updateDockItems()
+            // Installed desktop files may have changed: heuristic hits cached
+            // in IconResolver must not shadow newly added/renamed entries.
+            IconResolver.clearCache()
+            root.requestDockItemsUpdate()
         }
+    }
+
+    // Omarchy theme switches move icons: drop heuristic cache and rebuild
+    // so appLibrary.iconSource()/Quickshell.iconPath() re-resolve. The
+    // debris of one switch (accent + foreground + background + shellValues
+    // reassignments) coalesces into a single rebuild via the debounce.
+    Connections {
+        target: Color
+        function onThemeIconsStale() {
+            IconResolver.clearCache()
+            root.dbg("theme", "icon cache cleared on theme change")
+            root.requestDockItemsUpdate()
+        }
+        function onAccentChanged() { onThemeIconsStale() }
+        function onForegroundChanged() { onThemeIconsStale() }
+        function onBackgroundChanged() { onThemeIconsStale() }
+        function onShellValuesChanged() { onThemeIconsStale() }
     }
 
     // Pinned apps live inside primo.dock-settings.json under "pinned"
@@ -1051,22 +1166,7 @@ Item {
 
     Process {
         id: settingsWriter
-        command: ["python3", "-c",
-                  "import os, tempfile, sys, base64\n" +
-                  "path = sys.argv[1]\n" +
-                  "data = base64.b64decode(sys.argv[2])\n" +
-                  "parent = os.path.dirname(path)\n" +
-                  "os.makedirs(parent, exist_ok=True)\n" +
-                  "fd, tmp = tempfile.mkstemp(dir=parent, prefix='.settings-')\n" +
-                  "try:\n" +
-                  "    with os.fdopen(fd, 'wb') as f:\n" +
-                  "        f.write(data)\n" +
-                  "    os.replace(tmp, path)\n" +
-                  "except Exception as e:\n" +
-                  "    try: os.unlink(tmp)\n" +
-                  "    except: pass\n" +
-                  "    sys.exit(1)\n",
-                  root.settingsPath, ""]
+        command: ["python3", root.settingsWriterHelper, root.settingsPath, ""]
         onExited: function(code, status) {
             // Drain coalesced saves before re-reading: prevents lost updates
             // when pin/unpin or reorder are fired faster than the writer.
@@ -1074,21 +1174,7 @@ Item {
                 var nextJson = root.pendingDockJson
                 root.pendingDockJson = ""
                 root.writePending = false
-                settingsWriter.command = ["python3", "-c",
-                          "import os, tempfile, sys, base64\n" +
-                          "path = sys.argv[1]\n" +
-                          "data = base64.b64decode(sys.argv[2])\n" +
-                          "parent = os.path.dirname(path)\n" +
-                          "os.makedirs(parent, exist_ok=True)\n" +
-                          "fd, tmp = tempfile.mkstemp(dir=parent, prefix='.settings-')\n" +
-                          "try:\n" +
-                          "    with os.fdopen(fd, 'wb') as f:\n" +
-                          "        f.write(data)\n" +
-                          "    os.replace(tmp, path)\n" +
-                          "except Exception as e:\n" +
-                          "    try: os.unlink(tmp)\n" +
-                          "    except: pass\n" +
-                          "    sys.exit(1)\n",
+                settingsWriter.command = ["python3", root.settingsWriterHelper,
                           root.settingsPath, btoa(nextJson)]
                 settingsWriter.running = true
                 return
@@ -1102,6 +1188,7 @@ Item {
                 }
             } else {
                 // On failure, still drain a pending read if queued
+                root.dbg("settings", "settingsWriter failed (exit " + code + ")")
                 if (root.pendingRead) verifyDebounce.restart()
             }
         }
@@ -1153,21 +1240,7 @@ Item {
             root.writePending = true
             return
         }
-        settingsWriter.command = ["python3", "-c",
-                  "import os, tempfile, sys, base64\n" +
-                  "path = sys.argv[1]\n" +
-                  "data = base64.b64decode(sys.argv[2])\n" +
-                  "parent = os.path.dirname(path)\n" +
-                  "os.makedirs(parent, exist_ok=True)\n" +
-                  "fd, tmp = tempfile.mkstemp(dir=parent, prefix='.settings-')\n" +
-                  "try:\n" +
-                  "    with os.fdopen(fd, 'wb') as f:\n" +
-                  "        f.write(data)\n" +
-                  "    os.replace(tmp, path)\n" +
-                  "except Exception as e:\n" +
-                  "    try: os.unlink(tmp)\n" +
-                  "    except: pass\n" +
-                  "    sys.exit(1)\n",
+        settingsWriter.command = ["python3", root.settingsWriterHelper,
                   root.settingsPath, btoa(jsonStr)]
         settingsWriter.running = true
     }
@@ -1195,7 +1268,8 @@ Item {
     function setPinned(next) {
         root.pinnedIds = next
         root.savePinned()
-        root.updateDockItems()
+        // Rebuild follows via onPinnedIdsChanged debounce; no direct call
+        // (avoids a double rebuild per pin/unpin/reorder).
     }
 
     function saveBlacklist() {
@@ -1205,7 +1279,7 @@ Item {
     function setBlacklist(next) {
         root.blacklistIds = next
         root.saveBlacklist()
-        root.updateDockItems()
+        // Rebuild follows via onBlacklistIdsChanged debounce.
     }
 
     // Minimize an app to the dock (park all its windows on the special:minimized workspace)
@@ -1410,11 +1484,30 @@ Item {
     // System menu card height (two 32px rows + spacing + card padding)
     readonly property real systemMenuHeight: 32 * 2 + 2 + 4
 
+    // One-shot check for external tools the dock shells out to (clientsProbe
+    // and monitorSocketProc need hyprctl/jq/socat; float & minimize scripts
+    // need jq too). Without this a missing tool fails silently per-tick.
+    Process {
+        id: depCheckProc
+        stdout: SplitParser {
+            onRead: function(line) {
+                var value = String(line).trim()
+                if (value.indexOf("MISSING:") === 0) {
+                    var depMsg = "missing dependency: " + value.slice(8) + " — install it for full dock functionality"
+                    console.warn("primo.dock: " + depMsg)
+                    root.dbg("deps", depMsg)
+                }
+            }
+        }
+    }
+
     Component.onCompleted: {
         root.dockSettings = DockModel.parseSettings("")
         root.pinnedIds = DockModel.DEFAULT_PINNED.slice()
         root.blacklistIds = DockModel.DEFAULT_BLACKLIST.slice()
         IconResolver.loadCustomIcons({})
+        depCheckProc.command = ["bash", "-c", "for t in hyprctl jq socat; do command -v \"$t\" >/dev/null 2>&1 || echo \"MISSING:$t\"; done"]
+        depCheckProc.running = true
         refreshLayers()
         updatePluginEnabled()
         refreshClients()

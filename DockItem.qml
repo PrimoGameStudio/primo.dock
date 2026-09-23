@@ -138,10 +138,16 @@ Item {
                 if (!root.itemData) return ""
                 // Priority: explicit user override, then the already-resolved
                 // itemData.icon (appLibrary.iconSource(entry.icon)), then the
-                // heuristic resolution, then raw app identifiers.
+                // live desktop-entry lookup, then the hardcoded map inside
+                // resolveIcon, then raw app identifiers.
                 var custom = IconResolver.getCustomIcon(root.itemData.appId)
                 var iconName = custom || root.itemData.icon || ""
-                var resolved = IconResolver.resolveIcon(root.itemData.appClass, root.itemData.icon, root.itemData.appId)
+                var resolved = IconResolver.resolveIcon(root.itemData.appClass, root.itemData.icon, root.itemData.appId, function(q) {
+                    try {
+                        var e = DesktopEntries.heuristicLookup(q)
+                        return (e && e.id) ? String(e.id) : ""
+                    } catch (err) { return "" }
+                })
                 var candidates = []
                 if (resolved) {
                     candidates.push(resolved)

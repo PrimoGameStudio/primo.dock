@@ -53,10 +53,41 @@ quickshell ipc call primo.dock open
 
 # Close dock
 quickshell ipc call primo.dock close
+
+# Toggle debug logging (on / off / empty = flip current state)
+quickshell ipc call primo.dock debug on
 ```
 
 Set the dock toggle as a hyprland binding:
 o.bind("SUPER + SHIFT + ALT + Space", "", { launch = 'bash -c "quickshell -p /usr/share/omarchy/shell ipc call primo.dock toggle"' })
+
+---
+
+## 🐞 Debug Logging
+
+Off by default. Enable it either in `~/.config/omarchy/primo.dock-settings.json`:
+
+```json
+{ "debugLogging": true }
+```
+
+(the dock picks it up within a few seconds, no restart needed), or instantly via IPC:
+
+```bash
+quickshell ipc call primo.dock debug on   # off to disable, empty to toggle
+```
+
+While enabled, lifecycle events (probe failures/recovery, missing dependencies, settings-write failures, theme icon-cache clears) are appended to:
+
+```
+~/.local/state/omarchy/primo.dock/debug.log
+```
+
+(rotated once at 256 KiB to `debug.log.1`). Watch it live with:
+
+```bash
+tail -f ~/.local/state/omarchy/primo.dock/debug.log
+```
 
 ---
 

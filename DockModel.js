@@ -38,7 +38,8 @@ var DEFAULT_SETTINGS = {
     combineGroups: true,
     iconTintMode: "auto",
     iconTintColor: "accent",
-    iconTintStrength: 1.0
+    iconTintStrength: 1.0,
+    debugLogging: false
 };
 
 var HOVER_EFFECTS = ["none", "zoom", "bounce", "lift", "glow", "pulse"];

@@ -44,6 +44,13 @@ function loadCustomIcons(map) {
             if (value) customIconOverrides[String(k).toLowerCase().trim()] = value;
         }
     }
+    clearCache();
+}
+
+// Drop all cached heuristic resolutions (e.g. after an Omarchy theme
+// switch moves icons). The QML-side image:// URLs are re-resolved on the
+// next dockItems rebuild, which the caller must trigger.
+function clearCache() {
     iconCache = {};
 }
 
@@ -195,7 +202,7 @@ function shouldTintIconFor(appClass, appName, appId, mode) {
     return false;
 }
 
-function resolveIcon(appClass, appName, appId) {
+function resolveIcon(appClass, appName, appId, heuristic) {
     var checkId = appId || appClass || appName || "";
     var custom = getCustomIcon(checkId);
     if (custom) return custom;
@@ -212,6 +219,20 @@ function resolveIcon(appClass, appName, appId) {
     if (key.indexOf("chrome-") === 0 || key.indexOf("chromium-") === 0 || key.indexOf("crx_") === 0 || key.indexOf("webapp-") === 0) {
         iconCache[key] = "google-chrome";
         return "google-chrome";
+    }
+
+    // Live system lookup before the hardcoded map below: app updates can
+    // rename .desktop files, and the map below cannot know. The QML layer
+    // injects this (usually DesktopEntries.heuristicLookup wrapped to return
+    // an id string); omitted by callers that only need approximate identity.
+    if (typeof heuristic === "function") {
+        try {
+            var h = heuristic(raw);
+            if (h) {
+                iconCache[key] = h;
+                return h;
+            }
+        } catch (e) {}
     }
 
     var clean = sanitizeName(raw);
