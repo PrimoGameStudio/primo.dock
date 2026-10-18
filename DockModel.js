@@ -535,7 +535,7 @@ function cycleWindow(windows, activeToplevel, direction) {
     return arr[next];
 }
 
-function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appRows, appLibrary, minimizedIds, focusedWorkspaceId, focusedMonitorName, minimizedAddrSet, minimizedClassTitleSet, toplevelInfos, groupMap, combineGroups) {
+function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appRows, appLibrary, minimizedIds, focusedWorkspaceId, focusedMonitorName, minimizedAddrSet, minimizedClassTitleSet, toplevelInfos, groupMap, combineGroups, customIcons) {
     var pinned = Array.isArray(pinnedIds) ? pinnedIds : [];
     var list = toArray(toplevels);
 
@@ -669,6 +669,14 @@ function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appR
         return bucketsForApp[appId] || [];
     }
 
+    function customIconFor(appId) {
+        if (!customIcons) return ""
+        var key = String(appId || "").toLowerCase().trim()
+        if (!key) return ""
+        var v = customIcons[key]
+        return v ? String(v).trim() : ""
+    }
+
     function enrichItem(base) {
         var entry = entryFor(appRows, base.appId);
         if (entry && appLibrary) {
@@ -678,6 +686,13 @@ function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appR
             base.name = base.appId;
             base.icon = base.appId;
         }
+        // A user override wins over the desktop-entry icon and is stamped on
+        // the item so consumers never have to re-resolve it. Handed in from
+        // DockPanel because the JS library state is per-component, so
+        // DockItem.qml cannot read IconResolver's overrides reliably.
+        var custom = customIconFor(base.appId);
+        base.customIcon = custom;
+        if (custom) base.icon = custom;
         return base;
     }
 

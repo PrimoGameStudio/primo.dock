@@ -178,12 +178,16 @@ function isMonochromeSource(src) {
 // icon and the raw app identifiers so file:// custom icons keep their
 // filename markers even after iconSource() rewrites theme icons to
 // image:// URLs (which lose the filename).
-function shouldTintIconFor(appClass, appName, appId, mode) {
+function shouldTintIconFor(appClass, appName, appId, mode, customOverride) {
     var m = String(mode || "auto").toLowerCase();
     if (m === "none") return false;
     if (m === "all") return true;
     var candidates = [];
-    var custom = getCustomIcon(appId || appClass || appName);
+    // The override is passed in by the caller (DockItem) because .pragma
+    // library state is per-component: getCustomIcon() returns "" here even
+    // when DockPanel loaded overrides. Fall back to it for callers that only
+    // have the appId.
+    var custom = String(customOverride || "") || getCustomIcon(appId || appClass || appName);
     if (custom) candidates.push(custom);
     if (appName) candidates.push(appName);
     var resolved = resolveIcon(appClass, appName, appId);
