@@ -113,7 +113,7 @@ Item {
         function close() { root.close(); return "ok" }
         function toggle() { root.toggle(); return "ok" }
         function refresh() { return root.refresh() }
-        function debug(state) { return root.setDebugLogging(state) }
+        function debug(state: string) { return root.setDebugLogging(state) }
     }
 
     // Debug logging: file append via dockLog.py when dockDebugLogging is on.
@@ -1027,7 +1027,7 @@ Item {
         var lib = shell ? shell.appLibrary : null
         var fws = Hyprland.focusedWorkspace ? Hyprland.focusedWorkspace.id : undefined
         var fmon = Hyprland.focusedMonitor ? Hyprland.focusedMonitor.name : ""
-        root.dockItems = DockModel.buildDockItems(root.pinnedIds, root.blacklistIds, toplevels, active, root.appRows, lib, root.minimizedIds, fws, fmon, root.minimizedAddrs, root.minimizedClassTitles, root.toplevelInfos, root.groupMap, root.dockCombineGroups)
+        root.dockItems = DockModel.buildDockItems(root.pinnedIds, root.blacklistIds, toplevels, active, root.appRows, lib, root.minimizedIds, fws, fmon, root.minimizedAddrs, root.minimizedClassTitles, root.toplevelInfos, root.groupMap, root.dockCombineGroups, IconResolver.allCustomIcons())
         rebindOpenMenusToFreshItems()
     }
 
@@ -1106,15 +1106,15 @@ Item {
     // reassignments) coalesces into a single rebuild via the debounce.
     Connections {
         target: Color
-        function onThemeIconsStale() {
+        function clearThemeIconCache() {
             IconResolver.clearCache()
             root.dbg("theme", "icon cache cleared on theme change")
             root.requestDockItemsUpdate()
         }
-        function onAccentChanged() { onThemeIconsStale() }
-        function onForegroundChanged() { onThemeIconsStale() }
-        function onBackgroundChanged() { onThemeIconsStale() }
-        function onShellValuesChanged() { onThemeIconsStale() }
+        function onAccentChanged() { clearThemeIconCache() }
+        function onForegroundChanged() { clearThemeIconCache() }
+        function onBackgroundChanged() { clearThemeIconCache() }
+        function onShellValuesChanged() { clearThemeIconCache() }
     }
 
     // Pinned apps live inside primo.dock-settings.json under "pinned"
@@ -1175,7 +1175,7 @@ Item {
                 root.pendingDockJson = ""
                 root.writePending = false
                 settingsWriter.command = ["python3", root.settingsWriterHelper,
-                          root.settingsPath, btoa(nextJson)]
+                          root.settingsPath, Qt.btoa(nextJson)]
                 settingsWriter.running = true
                 return
             }
@@ -1241,7 +1241,7 @@ Item {
             return
         }
         settingsWriter.command = ["python3", root.settingsWriterHelper,
-                  root.settingsPath, btoa(jsonStr)]
+                  root.settingsPath, Qt.btoa(jsonStr)]
         settingsWriter.running = true
     }
 
@@ -1748,9 +1748,9 @@ Item {
                             }
                         }
                     }
-                    onEntered: function(mouse) {
+                    onEntered: function() {
                         mouseInside = true
-                        cursorCoord = root.isVertical ? mouse.y : mouse.x
+                        cursorCoord = root.isVertical ? mouseY : mouseX
                     }
                     onExited: {
                         mouseInside = false

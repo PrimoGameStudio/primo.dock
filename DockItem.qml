@@ -35,12 +35,17 @@ Item {
     property string iconTintMode: "auto"
     property color iconTintColor: Color.accent
     property real iconTintStrength: 1.0
+    // Theme-tinted copy of monochrome sources. Custom icons are candidates
+    // too: a HighContrast / -symbolic / -light override is exactly the
+    // monochrome artwork this recolors, and its filename markers are what the
+    // heuristic keys on. The override is passed explicitly because itemData.icon
+    // may already have been rewritten by iconSource().
     readonly property bool shouldTintIcon: {
         if (root.iconTintStrength <= 0) return false
         var mode = String(root.iconTintMode || "auto")
         if (mode === "none") return false
         if (!root.itemData) return mode === "all"
-        return IconResolver.shouldTintIconFor(root.itemData.appClass, root.itemData.icon, root.itemData.appId, mode)
+        return IconResolver.shouldTintIconFor(root.itemData.appClass, root.itemData.icon, root.itemData.appId, mode, root.itemData.customIcon)
     }
     readonly property bool containsMouse: mouseArea.containsMouse
 
@@ -127,21 +132,40 @@ Item {
             smooth: true
             mipmap: true
             asynchronous: true
-            // Hidden once tinted (the MultiEffect below samples it as a
-            // texture via layer.enabled, same pattern as omarchy tray
-            // symbolic icons) — but stay visible until loaded so the
-            // fallback glyph (a child) can still show.
-            visible: !root.shouldTintIcon || appIconImage.status !== Image.Ready
-            layer.enabled: root.shouldTintIcon
+            // Stays visible and keeps its layer enabled for the item's whole
+            // lifetime. Toggling either alongside iconTintMode made the
+            // MultiEffect below lose its source texture and render nothing, so
+            // switching modes at runtime blanked every icon until a restart.
+            // The effect composites on top of this image, so leaving the
+            // original visible costs nothing when tinting is on.
+            visible: true
+            layer.enabled: true
 
             source: {
                 if (!root.itemData) return ""
-                // Priority: explicit user override, then the already-resolved
-                // itemData.icon (appLibrary.iconSource(entry.icon)), then the
-                // live desktop-entry lookup, then the hardcoded map inside
+                // A user override (itemData.customIcon, baked in by
+                // DockModel.buildDockItems) wins outright. Read it here rather
+                // than from IconResolver because the .pragma library state is
+                // per-component, so DockItem cannot see DockPanel's overrides.
+                // An override may be a file:// URL or an absolute path (return
+                // as-is) or a bare theme name (resolve through the theme).
+                if (root.itemData.customIcon) {
+                    var ci = String(root.itemData.customIcon)
+                    if (ci.indexOf("file://") === 0 || ci.indexOf("/") === 0) return ci
+                    var cs = ""
+                    if (root.shell && root.shell.appLibrary && typeof root.shell.appLibrary.iconSource === "function") {
+                        cs = root.shell.appLibrary.iconSource(ci)
+                    }
+                    if (!cs || cs.length === 0) cs = Quickshell.iconPath(ci, true)
+                    if (cs && cs.length > 0 && cs.indexOf("application-x-executable") === -1) return cs
+                    // Unknown theme name: fall through to the normal chain so
+                    // the app still shows its default icon.
+                }
+                // Priority: the already-resolved itemData.icon
+                // (appLibrary.iconSource(entry.icon)), then the live
+                // desktop-entry lookup, then the hardcoded map inside
                 // resolveIcon, then raw app identifiers.
-                var custom = IconResolver.getCustomIcon(root.itemData.appId)
-                var iconName = custom || root.itemData.icon || ""
+                var iconName = root.itemData.icon || ""
                 var resolved = IconResolver.resolveIcon(root.itemData.appClass, root.itemData.icon, root.itemData.appId, function(q) {
                     try {
                         var e = DesktopEntries.heuristicLookup(q)
