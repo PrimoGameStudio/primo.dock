@@ -1,5 +1,7 @@
 ﻿# PrimoDock
 
+ [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/A3D729DKXZ)
+
 ![PrimoDock Preview](./preview.png)
 
 A native, highly polished animated application dock designed for **Omarchy Quattro** (Quickshell & Hyprland). PrimoDock brings fluid macOS-inspired dock physics, intelligent window tracking, multi-window management, and seamless theme synchronization to your Linux desktop.
