@@ -1320,6 +1320,34 @@ Item {
     }
 
     // Launch a fresh instance of an app (used by middle-click and the action card)
+    // Launch a Chromium --app webapp. appId and url are both client-derived
+    // (the class/id comes from Hyprland, the URL is parsed from it). Rather
+    // than funnel through omarchy-launch-or-focus-webapp -- whose host wrapper
+    // flattens $@ into a string that omarchy-launch-or-focus then evals -- argv
+    // is preserved all the way to the final launch: appId/url travel as
+    // positional parameters, are never interpolated into the script source,
+    // and nothing is evaled. forceNew always launches a fresh instance;
+    // otherwise an existing window of the same class is focused first.
+    function launchWebapp(appId, url, forceNew) {
+        var launcher = root.omarchyPath + "/bin/omarchy-launch-webapp"
+        if (forceNew) {
+            Quickshell.execDetached(["bash", "-lc", "exec \"$@\"", "bash", launcher, url])
+            return
+        }
+        // Focus-by-class: if a window of this class already exists, focus it;
+        // otherwise fall through to the launch below. Untrusted data rides as
+        // positional parameters ($1 = appId, then launcher, url), never
+        // interpolated into the script source; no eval.
+        var script =
+            "ADDR=$(hyprctl clients -j | jq -r --arg cls \"$1\" '.[] | select(.class == $cls) | .address' | head -n1); " +
+            "if [ -n \"$ADDR\" ]; then " +
+            "  hyprctl dispatch \"hl.dsp.focus({ window = \\\"address:$ADDR\\\" })\" >/dev/null 2>&1; " +
+            "else " +
+            "  shift; exec \"$@\"; " +
+            "fi"
+        Quickshell.execDetached(["bash", "-lc", script, "bash", appId, launcher, url])
+    }
+
     // Launch an app. forceNew=true (middle-click / "Open New Window") bypasses
     // focus-or-launch helpers so a genuinely new instance is requested.
     function launchApp(item, forceNew) {
@@ -1330,12 +1358,7 @@ Item {
         if (!DesktopEntries.byId(appId) && DockModel.isWebappClassId(appId)) {
             var url = DockModel.webappUrlFromId(appId)
             if (url.length > 0) {
-                if (forceNew) {
-                    Util.execDetached(root.omarchyPath + "/bin/omarchy-launch-webapp " + Util.shellQuote(url))
-                } else {
-                    Util.execDetached(root.omarchyPath + "/bin/omarchy-launch-or-focus-webapp "
-                        + Util.shellQuote(appId) + " " + Util.shellQuote(url))
-                }
+                launchWebapp(appId, url, forceNew)
                 return
             }
         }
@@ -1353,7 +1376,7 @@ Item {
             root.shell.appLibrary.launch(item.appId, item.name)
         } else {
             var target = item.appId ? (item.appId + ".desktop") : (item.exec + ".desktop")
-            Util.execDetached("uwsm-app -- gtk-launch " + Util.shellQuote(target) + " || uwsm-app -- " + item.exec)
+            Util.execDetached("uwsm-app -- gtk-launch " + Util.shellQuote(target) + " || uwsm-app -- bash -lc " + Util.shellQuote(item.exec))
         }
     }
 

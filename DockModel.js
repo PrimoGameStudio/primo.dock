@@ -340,13 +340,31 @@ function isPinned(pinnedIds, appId) {
 // don't exist, but the URL is fully recoverable from the id itself.
 var WEBAPP_CLASS_RE = /^chrome-(.+)-([A-Za-z0-9]+)$/;
 
+// Chromium --app class ids are client-controlled (raw UTF-8 from Hyprland).
+// The host-side omancy-launch-or-focus flattens its launch command into a
+// string and evals it, so any shell syntax derived from a client-chosen id
+// would reach host command execution. Validate the id-derived host/path here
+// so only legal DNS hostnames and URL-safe path characters are trusted;
+// anything else is rejected and the item falls through to ordinary launch.
+var WEBAPP_HOST_RE = /^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$/;
+var WEBAPP_PATH_RE = /^[A-Za-z0-9._\-~]*$/;
+
+function webappHostValid(host) {
+    return host.length > 0 && WEBAPP_HOST_RE.test(host);
+}
+
+function webappPathValid(path) {
+    return WEBAPP_PATH_RE.test(path);
+}
+
 function isWebappClassId(appId) {
     var m = WEBAPP_CLASS_RE.exec(String(appId || ""));
     if (!m) return false;
     var body = m[1];
     var sep = body.indexOf("__");
     var host = sep >= 0 ? body.slice(0, sep) : body;
-    return host.length > 0 && host.indexOf(".") > 0;
+    var path = sep >= 0 ? body.slice(sep + 2) : "";
+    return webappHostValid(host) && webappPathValid(path);
 }
 
 // Apps that accept a flag to force an additional window when relaunched.
@@ -373,7 +391,7 @@ function webappUrlFromId(appId) {
     var sep = body.indexOf("__");
     var host = sep >= 0 ? body.slice(0, sep) : body;
     var path = sep >= 0 ? body.slice(sep + 2) : "";
-    if (!host || host.indexOf(".") < 0) return "";
+    if (!webappHostValid(host) || !webappPathValid(path)) return "";
     var url = "https://" + host;
     if (path) url += "/" + path.replace(/_/g, "/");
     return url;
