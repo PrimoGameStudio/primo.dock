@@ -250,6 +250,14 @@ function resolveIcon(appClass, appName, appId, heuristic) {
         return iconCache[key];
     }
 
-    iconCache[key] = raw;
-    return raw;
+    // Never return a client-controlled window identity (app_id / app_class)
+    // verbatim as an icon source: a client can set app_id to "file://..." or
+    // an absolute path and reach Image.source directly. Only a plausible bare
+    // theme name is passed through; anything else falls back to the generic icon.
+    if (/^[A-Za-z0-9._+\-]+$/.test(raw)) {
+        iconCache[key] = raw;
+        return raw;
+    }
+    iconCache[key] = "application-x-executable";
+    return "application-x-executable";
 }

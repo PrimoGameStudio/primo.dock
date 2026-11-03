@@ -688,10 +688,10 @@ function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appR
         var entry = entryFor(appRows, base.appId);
         if (entry && appLibrary) {
             base.name = appLibrary.entryName(entry) || plainName(base.appId);
-            base.icon = appLibrary.iconSource(entry.icon) || base.appId;
+            base.icon = appLibrary.iconSource(entry.icon) || "application-x-executable";
         } else {
             base.name = plainName(base.appId);
-            base.icon = base.appId;
+            base.icon = "application-x-executable";
         }
         // A user override wins over the desktop-entry icon and is stamped on
         // the item so consumers never have to re-resolve it. Handed in from

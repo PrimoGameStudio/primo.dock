@@ -180,7 +180,11 @@ Item {
                     }
                 }
                 if (iconName && iconName !== resolved) candidates.push(iconName)
-                candidates.push(root.itemData.appClass, root.itemData.appId)
+                // appClass / appId are raw client-controlled window identities,
+                // not icons: never promote them straight into Image.source as
+                // file:// or absolute-path URLs. Bare theme names are still
+                // considered via resolveIcon() above; malicious IDs fall to
+                // the default fallback.
                 for (var i = 0; i < candidates.length; i++) {
                     var c = candidates[i]
                     if (!c) continue
