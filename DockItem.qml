@@ -204,6 +204,7 @@ Item {
                 anchors.centerIn: parent
                 visible: appIconImage.status !== Image.Ready
                 text: root.itemData && root.itemData.name ? root.itemData.name.charAt(0).toUpperCase() : "★"
+                textFormat: Text.PlainText
                 font.family: Style.font.family
                 font.bold: true
                 font.pixelSize: 14

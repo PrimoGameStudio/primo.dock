@@ -1967,6 +1967,7 @@ Item {
                     }
                     return base
                 }
+                textFormat: Text.PlainText
                 font.family: Style.font.family
                 font.pixelSize: 12
                 font.bold: true
@@ -2144,6 +2145,7 @@ Item {
                             Text {
                                 Layout.fillWidth: true
                                 text: actRow.actionData ? String(actRow.actionData.name || actRow.actionData.id || "Action") : ""
+                                textFormat: Text.PlainText
                                 font.family: Style.font.family
                                 font.pixelSize: 13
                                 color: actRowMouse.containsMouse ? Color.accent : Color.popups.text
@@ -2386,6 +2388,7 @@ Item {
 
                                 Text {
                                     text: modelData && modelData.workspaceName ? "[" + modelData.workspaceName + "]" : ""
+                                    textFormat: Text.PlainText
                                     font.family: Style.font.family
                                     font.pixelSize: 9
                                     color: Color.muted
@@ -2404,6 +2407,7 @@ Item {
                                         } catch (err) {}
                                         return an ? ("[" + an + "] " + t) : t
                                     }
+                                    textFormat: Text.PlainText
                                     font.family: Style.font.family
                                     font.pixelSize: 12
                                     elide: Text.ElideRight
@@ -2944,6 +2948,7 @@ Item {
                 Text {
                     Layout.fillWidth: true
                     text: iconInputDialog.targetItem ? ("Set Custom Icon: " + iconInputDialog.targetItem.name) : "Set Custom Icon"
+                    textFormat: Text.PlainText
                     font.family: Style.font.family
                     font.bold: true
                     font.pixelSize: 14
@@ -3034,6 +3039,7 @@ Item {
                         Layout.alignment: Qt.AlignVCenter
                         visible: iconInputDialog.validationError !== ""
                         text: iconInputDialog.validationError
+                        textFormat: Text.PlainText
                         font.family: Style.font.family
                         font.pixelSize: 12
                         color: Color.accent

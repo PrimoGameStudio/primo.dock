@@ -677,13 +677,20 @@ function buildDockItems(pinnedIds, blacklistIds, toplevels, activeToplevel, appR
         return v ? String(v).trim() : ""
     }
 
+    // Window titles / unmatched app_ids are untrusted strings. Strip anything
+    // that could be parsed as QML/Qt rich text so they can never carry markup
+    // (e.g. <img src=...>) into a Text element.
+    function plainName(s) {
+        return String(s == null ? "" : s).replace(/[<>&]/g, "")
+    }
+
     function enrichItem(base) {
         var entry = entryFor(appRows, base.appId);
         if (entry && appLibrary) {
-            base.name = appLibrary.entryName(entry) || base.appId;
+            base.name = appLibrary.entryName(entry) || plainName(base.appId);
             base.icon = appLibrary.iconSource(entry.icon) || base.appId;
         } else {
-            base.name = base.appId;
+            base.name = plainName(base.appId);
             base.icon = base.appId;
         }
         // A user override wins over the desktop-entry icon and is stamped on
