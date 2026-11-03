@@ -1294,20 +1294,19 @@ Item {
             Util.execDetached("hyprctl dispatch " + Util.shellQuote(lua))
             dispatched = true
         }
-        if (!dispatched) {
-            // Fallback: no per-window addresses available — move the first matching window by class
-            var luaFallback = 'hl.dsp.window.move({ workspace = "special:minimized", follow = false, window = "class:' + item.appId + '" })'
-            Util.execDetached("hyprctl dispatch " + Util.shellQuote(luaFallback))
-        }
+        // No unsafe fallback: never generate Lua/shell source from the client-controlled app ID.
+        // The exact address route above is the only path used for minimizing.
         root.refreshClients()
     }
 
     // Restore a minimized app back to the current workspace and focus one of its windows
+    // The app ID is client-controlled (raw UTF-8 from Hyprland, no shell filtering), so it is
+    // passed to jq as data via --arg instead of being interpolated into the jq program source.
     function restoreItem(item) {
         if (!item || !item.appId) return
         var script = "ACTIVE=$(hyprctl activeworkspace -j | jq -r .id); "
-            + "ADDRS=$(hyprctl clients -j | jq -r '.[] | select(.workspace.name == \"special:minimized\" and .class == \""
-            + item.appId + "\") | .address'); "
+            + "ADDRS=$(hyprctl clients -j | jq -r --arg cls " + Util.shellQuote(item.appId)
+            + " '.[] | select(.workspace.name == \"special:minimized\" and .class == $cls) | .address'); "
             + "last=\"\"; "
             + "for addr in $ADDRS; do "
             + "last=\"$addr\"; "
