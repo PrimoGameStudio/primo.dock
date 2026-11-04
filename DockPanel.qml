@@ -1374,10 +1374,12 @@ Item {
         }
         if (root.shell && root.shell.appLibrary && typeof root.shell.appLibrary.launch === "function") {
             root.shell.appLibrary.launch(item.appId, item.name)
-        } else {
-            var target = item.appId ? (item.appId + ".desktop") : (item.exec + ".desktop")
-            Util.execDetached("uwsm-app -- gtk-launch " + Util.shellQuote(target) + " || uwsm-app -- bash -lc " + Util.shellQuote(item.exec))
+            return
         }
+        // Fail closed: only launch desktop entries that actually exist on the host.
+        // item.exec is client-derived (raw Hyprland appId) and must never reach a shell.
+        if (!DesktopEntries.byId(item.appId)) return
+        Util.execDetached("uwsm-app -- gtk-launch " + Util.shellQuote(item.appId + ".desktop"))
     }
 
     // Close a single window (per-window ✕ / "Close Window" action)
