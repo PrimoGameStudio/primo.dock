@@ -114,6 +114,8 @@ Item {
         function toggle() { root.toggle(); return "ok" }
         function refresh() { return root.refresh() }
         function debug(state: string) { return root.setDebugLogging(state) }
+        function minimizeFocused() { return root.minimizeFocused() }
+        function restoreMinimized() { return root.restoreMinimized() }
     }
 
     // Debug logging: file append via dockLog.py when dockDebugLogging is on.
@@ -658,6 +660,9 @@ Item {
     property var minimizedIds: []
     property var minimizedAddrs: ({})
     property var minimizedClassTitles: ({})
+    // Address of the last window minimized via minimizeFocused() over IPC,
+    // so restoreMinimized() can bring it back to the focused workspace.
+    property string lastMinimizedAddr: ""
 
     Process {
         id: clientsProbe
@@ -1317,6 +1322,37 @@ Item {
             + "fi"
         Util.execDetached("bash -c " + Util.shellQuote(script))
         root.refreshClients()
+    }
+
+    // Minimize the focused Hyprland window to the dock (special:minimized).
+    // Called over IPC by the SUPER + M binding. Ignores the dock/shell itself.
+    function minimizeFocused() {
+        var active = ToplevelManager.activeToplevel
+        if (!active) return "no active window"
+        var ht = active.HyprlandToplevel
+        if (!ht || !ht.address) return "no address"
+        var appId = String(active.appId || "")
+        if (appId === "quickshell" || appId === "hyprland") return "ignored"
+        var addr = String(ht.address)
+        if (addr.indexOf("0x") !== 0) addr = "0x" + addr
+        var lua = 'hl.dsp.window.move({ workspace = "special:minimized", follow = false, window = "address:' + addr + '" })'
+        Util.execDetached("hyprctl dispatch " + Util.shellQuote(lua))
+        root.lastMinimizedAddr = addr
+        root.refreshClients()
+        return "ok"
+    }
+
+    // Restore the last window minimized via minimizeFocused() back to the
+    // focused workspace and focus it. Called over IPC.
+    function restoreMinimized() {
+        var addr = root.lastMinimizedAddr
+        if (!addr) return "none tracked"
+        var wsId = Hyprland.focusedWorkspace ? Hyprland.focusedWorkspace.id : 1
+        var lua = 'hl.dsp.window.move({ workspace = ' + Number(wsId) + ', follow = true, window = "address:' + addr + '" })'
+        Util.execDetached("hyprctl dispatch " + Util.shellQuote(lua))
+        root.lastMinimizedAddr = ""
+        root.refreshClients()
+        return "ok"
     }
 
     // Launch a fresh instance of an app (used by middle-click and the action card)
